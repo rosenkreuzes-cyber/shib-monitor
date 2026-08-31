@@ -1,0 +1,52 @@
+const BACKEND_URL="";
+const $=id=>document.getElementById(id);
+let prev=null,lastBuy=0,lastSell=0,popupTimer;
+
+function popup(title,text,type){
+  $("popupTitle").textContent=title;$("popupText").textContent=text;
+  const p=$("popup");p.style.borderColor=type==="buy"?"#43e6a5":"#ff647d";p.classList.add("show");
+  clearTimeout(popupTimer);popupTimer=setTimeout(()=>p.classList.remove("show"),7000);
+}
+async function notice(title,text,type){
+  popup(title,text,type);
+  if(!("Notification"in window)||Notification.permission!=="granted")return;
+  try{const r=await navigator.serviceWorker.ready;await r.showNotification(title,{body:text,tag:"shib-"+type,renotify:true})}catch(e){}
+}
+$("notifyBtn").onclick=async()=>{
+  if(!("Notification"in window)){popup("通知非対応","このブラウザは通知API非対応です","sell");return}
+  const p=await Notification.requestPermission();
+  popup(p==="granted"?"通知ON":"通知OFF",p==="granted"?"通知を有効化しました":"通知を許可できませんでした",p==="granted"?"buy":"sell")
+};
+function check(s,d){
+  const th=Math.max(1,+$("threshold").value||10),cd=Math.max(5,+$("cooldown").value||60)*1000,n=Date.now();
+  if(prev!==null){
+    const x=s-prev;
+    if(x>=th&&$("buyEnabled").checked&&n-lastBuy>=cd){lastBuy=n;notice("🟢 SHIB 買い圧力急上昇",`+${x.toFixed(1)}pt / ${s.toFixed(1)}/100（${d.label}）`,"buy")}
+    if(x<=-th&&$("sellEnabled").checked&&n-lastSell>=cd){lastSell=n;notice("🔴 SHIB 売り圧力急上昇",`-${Math.abs(x).toFixed(1)}pt / ${s.toFixed(1)}/100（${d.label}）`,"sell")}
+  }
+  prev=s;
+}
+function update(d){
+  const b=d.book||{},f=d.trade_flow||{},l=d.large_trade_flow||{},a=d.absorption||{},bc=b.book_change||{},s=+d.score||0,i=+b.imbalance_pct||50,t=+f.buy_pct||50;
+  $("price").textContent=d.price==null?"--":"¥"+Number(d.price).toLocaleString("ja-JP",{maximumFractionDigits:10});
+  $("score").textContent=s.toFixed(1)+" / 100";$("label").textContent=d.label||"--";
+  $("bid").textContent=i.toFixed(1)+"%";$("ask").textContent=(100-i).toFixed(1)+"%";$("bidbar").style.width=i+"%";
+  $("tb").textContent=t.toFixed(1)+"%";$("ts").textContent=(100-t).toFixed(1)+"%";$("tbar").style.width=t+"%";
+  $("bookBuy").textContent=(bc.buy_pct||50).toFixed(1)+"%";$("bookSell").textContent=(bc.sell_pct||50).toFixed(1)+"%";$("events").textContent=bc.events||0;
+  const w=b.walls||[];$("walls").innerHTML=w.length?w.slice(0,5).map(x=>(x.side==="buy"?"🟢買い壁":"🔴売り壁")+" ¥"+Number(x.price).toLocaleString()+" ×"+x.multiple+"倍").join("<br>"):"検出なし";
+  $("largeBuy").textContent=(l.buy_pct||50).toFixed(1)+"%";$("largeSell").textContent=(l.sell_pct||50).toFixed(1)+"%";
+  $("absBuy").textContent=Number(a.buy||0).toLocaleString();$("absSell").textContent=Number(a.sell||0).toLocaleString();
+  $("detail").textContent=`BBO: ${b.best_bid??"--"} / ${b.best_ask??"--"}\n板インバランス: ${i.toFixed(1)}% buy\n約定フロー: ${t.toFixed(1)}% buy\n大口約定: ${(l.buy_pct||50).toFixed(1)}% buy\n板急変: ${(bc.buy_pct||50).toFixed(1)}% buy / ${(bc.sell_pct||50).toFixed(1)}% sell\n巨大注文: ${w.length}件\nsequence: ${b.sequence??"--"}\n判定: ${d.label||"--"}\nスコア: ${s.toFixed(1)}/100`;
+  check(s,d);
+}
+function connect(){
+  const base=BACKEND_URL.replace(/\/$/,"");
+  const url=base?base.replace(/^http/,"ws")+"/ws":(location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/ws";
+  const ws=new WebSocket(url);
+  ws.onopen=()=>$("connection").textContent="リアルタイム接続中";
+  ws.onmessage=e=>{try{update(JSON.parse(e.data))}catch(_){}};
+  ws.onclose=()=>{ $("connection").textContent="再接続中...";setTimeout(connect,3000)};
+  ws.onerror=()=>ws.close();
+}
+connect();
+if("serviceWorker"in navigator)navigator.serviceWorker.register("sw.js").catch(()=>{});
