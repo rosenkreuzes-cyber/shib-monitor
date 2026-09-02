@@ -1,47 +1,31 @@
-import asyncio
+import asyncio,logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI,WebSocket,WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from analyzer import MarketAnalyzer
 from bitbank_stream import BitbankStream
-
+logging.basicConfig(level=logging.INFO)
 PAIR="shib_jpy"; analyzer=MarketAnalyzer(); clients=set()
-
 async def broadcast():
-    d=analyzer.snapshot()
+    data=analyzer.snapshot(); dead=[]
     for ws in list(clients):
-        try: await ws.send_json(d)
-        except Exception: clients.discard(ws)
-
-async def handle(room,msg):
-    d=(msg or {}).get("data",{}); room=room or ""
-    if room.startswith("depth_diff_"): analyzer.diff(d); await broadcast()
-    elif room.startswith("depth_whole_"): analyzer.whole(d); await broadcast()
-    elif room.startswith("transactions_"):
-        for t in d.get("transactions",[]): analyzer.trade(t.get("side",""),float(t.get("price",0)),float(t.get("amount",0)),t.get("executed_at"))
-        await broadcast()
-    elif room.startswith("ticker_") and d.get("last"):
-        analyzer.prev_price=analyzer.last_price; analyzer.last_price=float(d["last"]); await broadcast()
-
-async def runner():
-    while True:
-        try: await BitbankStream(PAIR,handle).run()
-        except Exception as e: print("reconnect",repr(e)); await asyncio.sleep(5)
-
+        try: await ws.send_json(data)
+        except Exception: dead.append(ws)
+    for ws in dead: clients.discard(ws)
+async def stream_runner(): await BitbankStream(PAIR,analyzer,broadcast).run()
 @asynccontextmanager
 async def lifespan(app):
-    task=asyncio.create_task(runner()); yield; task.cancel()
-
-app=FastAPI(title="SHIB Monitor OrderFlow v3",lifespan=lifespan)
+    task=asyncio.create_task(stream_runner()); yield; task.cancel()
+app=FastAPI(title="SHIB Monitor OrderFlow v4",lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
-
 @app.get("/health")
-async def health(): return JSONResponse({"ok":True})
+async def health():
+    s=analyzer.snapshot()
+    return {"ok":True,"pair":PAIR,"book_ready":s["book"]["ready"],"price":s["price"],"sequence":s["book"]["sequence"]}
 @app.get("/api/analysis")
 async def analysis(): return analyzer.snapshot()
 @app.websocket("/ws")
-async def ws(socket:WebSocket):
+async def websocket(socket:WebSocket):
     await socket.accept(); clients.add(socket)
     try:
         await socket.send_json(analyzer.snapshot())
