@@ -1,1 +1,224 @@
-<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#09101f"><link rel="manifest" href="manifest.webmanifest"><link rel="stylesheet" href="style.css"><title>SHIB Monitor OrderFlow v5</title></head><body><main><header><div><h1>SHIB / JPY</h1><small id="connection">接続中...</small> ・ <small id="version">v5.0</small></div><button id="notifyBtn">通知を許可</button></header><div class="price" id="price">--</div><div class="signal"><small>総合圧力</small><div id="score">--</div><b id="label">--</b><small id="source">--</small></div><section class="grid"><article><h2>板インバランス</h2><p>買い <b id="bid">--</b></p><div class="bar"><i id="bidbar"></i></div><p>売り <b id="ask">--</b></p><p>レベル <b id="levels">--</b></p></article><article><h2>約定フロー 10秒</h2><p>買い <b id="tb">--</b></p><div class="bar"><i id="tbar"></i></div><p>売り <b id="ts">--</b></p></article><article><h2>板の急変 5秒</h2><p>買い <b id="bookBuy">--</b></p><p>売り <b id="bookSell">--</b></p><p>イベント <b id="events">--</b></p></article><article><h2>巨大注文</h2><div id="walls">--</div></article><article><h2>大口約定</h2><p>買い <b id="largeBuy">--</b></p><p>売り <b id="largeSell">--</b></p></article><article><h2>吸収候補</h2><p>買い <b id="absBuy">--</b></p><p>売り <b id="absSell">--</b></p></article></section><article class="settings"><h2>通知設定</h2><label>🟢買い急上昇 <input id="buyEnabled" type="checkbox" checked></label><label>🔴売り急上昇 <input id="sellEnabled" type="checkbox" checked></label><label>しきい値 <input id="threshold" type="number" value="10" min="1"> pt</label><label>クールダウン <input id="cooldown" type="number" value="60" min="5"> 秒</label></article><pre id="detail">データ待ち...</pre></main><div id="popup"><b id="popupTitle"></b><div id="popupText"></div></div><script src="app.js"></script></body></html>
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SHIB Monitor v5.1</title>
+<style>
+:root{--bg:#07090b;--panel:#0d1216;--line:#2a343c;--text:#e9eef2;--muted:#9aa7b0;--green:#62d84e;--red:#ff4b4b;--yellow:#ffd43b;--blue:#58a6ff}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#111920 0,#07090b 45%,#030405 100%);color:var(--text);font-family:system-ui,-apple-system,BlinkMacSystemFont,"Noto Sans JP",sans-serif}
+header{display:flex;justify-content:space-between;align-items:center;padding:18px 22px;border-bottom:1px solid var(--line);gap:12px;flex-wrap:wrap}
+h1{margin:0;font-size:25px} .sub{color:var(--muted);font-size:13px;margin-top:3px}.live{padding:8px 13px;border:1px solid var(--green);border-radius:8px;color:var(--green);font-weight:700}
+.container{padding:14px;max-width:1500px;margin:auto}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:10px}.card{background:linear-gradient(145deg,#10161b,#080c0f);border:1px solid var(--line);border-radius:8px;padding:14px;box-shadow:0 8px 25px #0005}.span12{grid-column:span 12}.span8{grid-column:span 8}.span6{grid-column:span 6}.span4{grid-column:span 4}.span3{grid-column:span 3}
+.title{font-size:16px;font-weight:700;margin-bottom:12px}.muted{color:var(--muted)}.big{font-size:30px;font-weight:800}.green{color:var(--green)}.red{color:var(--red)}.yellow{color:var(--yellow)}.blue{color:var(--blue)}
+.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.metric{padding:9px;border-right:1px solid var(--line)}.metric:last-child{border:0}.label{color:var(--muted);font-size:12px}.value{font-size:22px;font-weight:700;margin-top:5px}
+.status{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}.pill{padding:5px 9px;border-radius:6px;border:1px solid var(--line)}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:7px 6px;border-bottom:1px solid #20282e;text-align:right}th:first-child,td:first-child{text-align:left}
+.bar{height:10px;background:#1b2329;border-radius:4px;overflow:hidden}.bar i{display:block;height:100%}
+.score{text-align:center}.score .num{font-size:52px;font-weight:900}.meter{height:14px;background:#1a2228;border-radius:10px;overflow:hidden;margin:10px 0}.meter i{display:block;height:100%;background:var(--green)}
+.alert{padding:10px;border-radius:6px;border:1px solid var(--line);margin-bottom:8px}.ok{border-color:#27552b}.bad{border-color:#6a2424}.warn{border-color:#66521c}
+canvas{width:100%;height:230px;background:#080c0f;border:1px solid #20282e;border-radius:6px}
+input,button{background:#0a0f13;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px}button{cursor:pointer}button:hover{border-color:#596771}.api{display:flex;gap:7px}.api input{flex:1;min-width:200px}
+@media(max-width:900px){.span8,.span6,.span4,.span3{grid-column:span 12}.metrics{grid-template-columns:1fr}.metric{border-right:0;border-bottom:1px solid var(--line)}}
+</style>
+</head>
+<body>
+<header>
+ <div><h1>SHIB Monitor API v5.1</h1><div class="sub">リアルタイム板情報モニター（修正版）</div></div>
+ <div id="topStatus" class="live">● 接続確認中</div>
+</header>
+
+<div class="container">
+<div class="card api">
+ <input id="apiUrl" value="https://shib-monitor-api.onrender.com/" aria-label="API URL">
+ <button onclick="saveAndFetch()">接続</button>
+</div><br>
+
+<div class="grid">
+ <section class="card span8">
+  <div class="metrics">
+   <div class="metric"><div class="label">ペア</div><div id="pair" class="big">SHIB/JPY</div></div>
+   <div class="metric"><div class="label">現在価格</div><div id="price" class="big green">--</div></div>
+   <div class="metric"><div class="label">24h変動率</div><div id="change" class="big">--</div></div>
+  </div>
+ </section>
+ <section class="card span4">
+  <div class="title">接続状態</div>
+  <div class="status"><span>WebSocket <b id="ws">--</b></span><span>API <b id="api">--</b></span><span>再接続 <b id="reconnect">--</b></span></div>
+  <hr style="border-color:#20282e">
+  <div>最終取得 <b id="serverTime">--</b></div>
+ </section>
+
+ <section class="card span8">
+  <div class="title">板情報の状態</div>
+  <div id="bookState" class="alert warn">確認中…</div>
+  <div class="metrics">
+   <div class="metric"><div class="label">板の経過時間</div><div id="age" class="big">--</div></div>
+   <div class="metric"><div class="label">鮮度ランク</div><div id="fresh" class="big">--</div></div>
+   <div class="metric"><div class="label">判定への利用</div><div id="use" class="big">--</div></div>
+  </div>
+ </section>
+ <section class="card span4">
+  <div class="title">鮮度基準</div>
+  <table><tr><th>経過時間</th><th>状態</th></tr><tr><td>0〜3秒</td><td class="green">LIVE</td></tr><tr><td>3〜10秒</td><td class="yellow">CAUTION</td></tr><tr><td>10〜30秒</td><td class="red">STALE</td></tr><tr><td>30秒以上</td><td class="red">INVALID</td></tr></table>
+ </section>
+
+ <section class="card span4">
+  <div class="title">ベストプライス</div>
+  <table><tr><td>最良買い (BID)</td><td id="bid" class="green">--</td></tr><tr><td>最良売り (ASK)</td><td id="ask" class="red">--</td></tr><tr><td>スプレッド</td><td id="spread">--</td></tr><tr><td>ミッド価格</td><td id="mid">--</td></tr><tr><td>価格との整合性</td><td id="mismatch">--</td></tr></table>
+ </section>
+ <section class="card span4">
+  <div class="title">板のバランス指標</div>
+  <div class="score"><div id="imb" class="big">--%</div><div id="imbLabel" class="green">--</div></div>
+  <table><tr><td>買い加重</td><td id="wbid">--</td></tr><tr><td>売り加重</td><td id="wask">--</td></tr><tr><td>買い/売り比率</td><td id="ratio">--</td></tr></table>
+ </section>
+ <section class="card span4">
+  <div class="title">判定スコア</div>
+  <div class="score"><div id="score" class="num">--</div><div>/ 100</div><div id="label" class="pill">--</div></div>
+  <div class="meter"><i id="scoreBar" style="width:0%"></i></div>
+ </section>
+
+ <section class="card span6">
+  <div class="title">トレードフロー（取得できる場合）</div>
+  <table><tr><th>区分</th><th>数量(SHIB)</th><th>割合</th></tr><tr><td class="green">買い</td><td id="buyQty">--</td><td id="buyPct">--</td></tr><tr><td class="red">売り</td><td id="sellQty">--</td><td id="sellPct">--</td></tr></table>
+ </section>
+ <section class="card span6"><div class="title">価格履歴</div><canvas id="chart" width="700" height="230"></canvas></section>
+
+ <section class="card span4">
+  <div class="title">システム情報</div>
+  <table><tr><td>APIバージョン</td><td id="version">--</td></tr><tr><td>データソース</td><td id="source">--</td></tr><tr><td>イベント数</td><td id="events">--</td></tr><tr><td>最終板更新</td><td id="lastUpdate">--</td></tr><tr><td>板データ</td><td id="ready">--</td></tr></table>
+ </section>
+ <section class="card span8">
+  <div class="title">診断・イベント</div>
+  <div id="alerts"></div>
+ </section>
+</div>
+<p class="muted" style="text-align:center">※投資判断は自己責任で行ってください。本システムは情報提供のみを目的としており、売買を推奨するものではありません。</p>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+let prices=[], lastGood=null;
+const saved=localStorage.getItem("shibApiUrl"); if(saved) $("apiUrl").value=saved;
+
+function num(v){return typeof v==="number"&&isFinite(v)?v:null}
+function fmt(v,d=6){return num(v)==null?"--":v.toFixed(d)}
+function fmtQty(v){return num(v)==null?"--":(v/1e6).toFixed(2)+"M"}
+function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
+
+function extract(d){
+  const b=d.book||{};
+  return {
+   pair:d.pair||"SHIB/JPY", price:num(d.price),
+   change:num(d.price_change_pct),
+   score:num(d.score), label:d.label||"",
+   ws:d.ws_connected ?? d.wsConnected ?? b.ws_connected ?? false,
+   ready:b.ready ?? d.book_ready ?? false,
+   bid:num(b.best_bid), ask:num(b.best_ask), mid:num(b.mid),
+   imb:num(b.imbalance_pct), wbid:num(b.weighted_bid), wask:num(b.weighted_ask),
+   age:num(b.snapshot_age_sec ?? d.snapshot_age_sec),
+   events:num(d.events), reconnect:num(d.reconnect_count),
+   source:d.source||d.data_source||"", version:d.version||"",
+   lastUpdate:d.last_update_ts||b.last_update_ts||d.last_update||null,
+   serverTime:d.server_time||null,
+   buy:num(d.buy_qty ?? d.trade_flow?.buy_qty ?? d.trade_flow?.buy),
+   sell:num(d.sell_qty ?? d.trade_flow?.sell_qty ?? d.trade_flow?.sell),
+   buyPct:num(d.buy_pct ?? d.trade_flow?.buy_pct),
+   sellPct:num(d.sell_pct ?? d.trade_flow?.sell_pct)
+  };
+}
+
+function freshness(age){
+ if(age==null)return["UNKNOWN","--","取得不能","warn"];
+ if(age<=3)return["LIVE","LIVE","使用中","ok"];
+ if(age<=10)return["CAUTION","CAUTION","注意して使用","warn"];
+ if(age<=30)return["STALE","STALE","判定を抑制","warn"];
+ return["INVALID","INVALID","判定に使用しない","bad"];
+}
+function render(d){
+ lastGood=d;
+ $("pair").textContent=d.pair;
+ $("price").textContent=d.price==null?"--":d.price.toFixed(6)+" JPY";
+ $("change").textContent=d.change==null?"--":(d.change>=0?"+":"")+d.change.toFixed(2)+"%";
+ $("change").className="big "+(d.change>0?"green":d.change<0?"red":"");
+ $("ws").innerHTML=d.ws?'<span class="green">● CONNECTED</span>':'<span class="red">● DISCONNECTED</span>';
+ $("api").innerHTML='<span class="green">● OK</span>';
+ $("reconnect").textContent=d.reconnect??"--";
+ $("serverTime").textContent=d.serverTime??"--";
+ $("version").textContent=d.version||"--"; $("source").textContent=d.source||"--";
+ $("events").textContent=d.events??"--"; $("lastUpdate").textContent=d.lastUpdate??"--";
+ $("ready").textContent=d.ready?"READY":"NOT READY";
+
+ $("bid").textContent=fmt(d.bid); $("ask").textContent=fmt(d.ask); $("mid").textContent=fmt(d.mid);
+ if(d.bid!=null&&d.ask!=null){
+   const sp=d.ask-d.bid, pct=d.mid?sp/d.mid*100:null;
+   $("spread").textContent=fmt(sp)+" ("+(pct==null?"--":pct.toFixed(2)+"%")+")";
+ } else $("spread").textContent="--";
+ let mismatch=false;
+ if(d.price!=null&&d.bid!=null&&d.ask!=null) mismatch=d.price<d.bid||d.price>d.ask;
+ $("mismatch").textContent=(d.bid!=null&&d.ask!=null)?(d.bid<=d.ask?(mismatch?"⚠ 乖離あり":"✓ 正常"):"✕ BID>ASK"): "--";
+ $("mismatch").className=mismatch?"red":"green";
+
+ const [rank,rank2,use,cls]=freshness(d.age);
+ $("age").textContent=d.age==null?"--":d.age.toFixed(1)+" 秒";
+ $("fresh").textContent=rank2; $("fresh").className="big "+(rank==="LIVE"?"green":rank==="CAUTION"?"yellow":"red");
+ $("use").textContent=(rank==="INVALID"||rank==="UNKNOWN")?"停止":use; $("use").className="big "+((rank==="INVALID"||rank==="UNKNOWN")?"red":"green");
+ $("bookState").className="alert "+cls;
+ $("bookState").textContent=rank==="LIVE"?"✓ 板情報の状態：正常（LIVE）":rank==="CAUTION"?"⚠ 板情報：CAUTION（少し古い）":rank==="STALE"?"⚠ 板情報：STALE（判定を抑制）":"✕ 板情報：INVALID（判定停止）";
+
+ $("imb").textContent=d.imb==null?"--%":d.imb.toFixed(1)+"%";
+ $("imbLabel").textContent=d.imb==null?"--":d.imb>=50?"買い優勢":"売り優勢";
+ $("imbLabel").className=d.imb>=50?"green":"red";
+ $("wbid").textContent=fmtQty(d.wbid); $("wask").textContent=fmtQty(d.wask);
+ $("ratio").textContent=(d.wbid!=null&&d.wask>0)?(d.wbid/d.wask).toFixed(2):"--";
+
+ const usable=rank!=="INVALID"&&rank!=="UNKNOWN"&&!mismatch;
+ const shownScore=usable?d.score:null;
+ $("score").textContent=shownScore==null?"--":shownScore.toFixed(1);
+ $("scoreBar").style.width=(shownScore==null?0:Math.max(0,Math.min(100,shownScore)))+"%";
+ $("label").textContent=shownScore==null?"判定停止":(d.label|| (shownScore>=60?"買い優勢":shownScore<=40?"売り優勢":"中立"));
+ $("label").className="pill "+(shownScore>=60?"green":shownScore<=40?"red":"yellow");
+
+ $("buyQty").textContent=fmtQty(d.buy); $("sellQty").textContent=fmtQty(d.sell);
+ $("buyPct").textContent=d.buyPct==null?"--":d.buyPct.toFixed(1)+"%";
+ $("sellPct").textContent=d.sellPct==null?"--":d.sellPct.toFixed(1)+"%";
+
+ const notes=[];
+ if(!d.ws)notes.push(["bad","WebSocket接続が確認できません"]);
+ if(d.age==null)notes.push(["bad","板更新時刻を取得できません"]);
+ else if(d.age>30)notes.push(["bad",`板が${d.age.toFixed(1)}秒古いため、スコア判定を停止しました`]);
+ else if(d.age>3)notes.push(["warn",`板の鮮度は${d.age.toFixed(1)}秒：CAUTION/STALE`]);
+ if(mismatch)notes.push(["bad","現在価格とBID/ASKの整合性に異常があります"]);
+ if(!notes.length)notes.push(["ok","✓ 板情報は判定条件を満たしています"]);
+ $("alerts").innerHTML=notes.map(x=>`<div class="alert ${x[0]}">${esc(x[1])}</div>`).join("");
+
+ if(d.price!=null){prices.push(d.price); if(prices.length>80)prices.shift(); draw()}
+ $("topStatus").textContent=usable?"● LIVE":"● DATA CHECK";
+ $("topStatus").style.color=usable?"var(--green)":"var(--yellow)";
+}
+
+function draw(){
+ const c=$("chart"),ctx=c.getContext("2d"),w=c.width,h=c.height;
+ ctx.clearRect(0,0,w,h); if(prices.length<2)return;
+ ctx.strokeStyle="#273039";ctx.lineWidth=1;
+ for(let i=1;i<5;i++){let y=i*h/5;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()}
+ let mn=Math.min(...prices),mx=Math.max(...prices); if(mx===mn){mx+=1;mn-=1}
+ ctx.strokeStyle="#58a6ff";ctx.lineWidth=2;ctx.beginPath();
+ prices.forEach((p,i)=>{let x=i*(w-20)/(prices.length-1)+10,y=h-10-(p-mn)/(mx-mn)*(h-20);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke();
+}
+async function fetchData(){
+ const url=$("apiUrl").value.trim(); if(!url)return;
+ try{
+  const r=await fetch(url,{cache:"no-store",headers:{"Accept":"application/json"}});
+  if(!r.ok)throw new Error("HTTP "+r.status);
+  const raw=await r.json(), d=extract(raw); render(d);
+ }catch(e){
+  $("topStatus").textContent="● API ERROR"; $("topStatus").style.color="var(--red)";
+  $("api").innerHTML='<span class="red">● ERROR</span>';
+  $("alerts").innerHTML='<div class="alert bad">API取得エラー：'+esc(e.message)+'</div>';
+ }
+}
+function saveAndFetch(){localStorage.setItem("shibApiUrl",$("apiUrl").value.trim());fetchData()}
+fetchData(); setInterval(fetchData,1000);
+</script>
+</body>
+</html>
