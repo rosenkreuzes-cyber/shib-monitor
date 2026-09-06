@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: shib-monitor-v5-3
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 30
+    healthCheckPath: /api/health
+    envVars:
+      - key: POLL_SECONDS
+        value: "1.0"
+      - key: STALE_SECONDS
+        value: "30"
+      - key: TOP_N
+        value: "10"

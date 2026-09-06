@@ -1,22 +1,41 @@
-# SHIB Monitor v5.1 完全版
+# SHIB Monitor API v5.3
 
-## v5.1修正
-- 板鮮度を「最後のRESTスナップショット」ではなく「最後に受信した板メッセージ」で計測。
-- WS差分を受信するたび `snapshot_age_sec` を更新。
-- 30秒超でINVALID、スコア判定停止。
-- 価格とBID/ASKの整合性を監視。
-- TOP10 BID/ASKをAPIレスポンスに追加。
-- 直近1分の約定フローを表示。
-- スコア内訳をAPI化。
-- WSの板更新が30秒止まった場合、自動的に再接続してRESTスナップショットを再取得。
+SHIB/JPY の公開板情報を Coincheck から取得し、スマートフォン縦画面で
+「買い板（BID）」「価格」「売り板（ASK）」を左右に並べ、数量を横バーで比較する監視アプリです。
 
-## Render Backend
-Root Directory: `backend`
-Build: `pip install -r requirements.txt`
-Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+## 構成
 
-## Frontend
-`frontend/` を静的ホスティングへ配置。`app.js` のAPI URLは画面から変更可能。
+Coincheck REST API
+→ Flask バックエンド
+→ `/api/orderbook`
+→ スマホ向け HTML/CSS/JS
+
+v5.3 はまず REST 1秒ポーリングを安定動作させる構成です。
+30秒以上データ更新がない場合は `STALE` とし、判定利用を停止します。
+
+## Render
+
+1. GitHub にこのフォルダをアップロード
+2. Render で Web Service を作成
+3. Build Command:
+   `pip install -r requirements.txt`
+4. Start Command:
+   `gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 30`
+
+`render.yaml` を使う場合は Blueprint として読み込めます。
 
 ## API
-GET `/health` / GET `/api/analysis` / WebSocket `/ws`
+
+- `/` スマホ監視画面
+- `/api/orderbook` 正規化済み板データ
+- `/api/health` ヘルスチェック
+
+## 板バランス
+
+TOP10の板数量から、
+
+`(買い板数量 - 売り板数量) / (買い板数量 + 売り板数量) × 100`
+
+で算出します。
+
+これは板の需給傾向を表示するための指標で、価格予測や売買を保証するものではありません。
