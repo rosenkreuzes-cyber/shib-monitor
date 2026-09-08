@@ -3,237 +3,63 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#050a12">
-<title>SHIB Monitor API v5.3</title>
+<title>SHIB Monitor v5.2</title>
 <style>
-:root{--bg:#050a12;--panel:#0a1320;--line:#203047;--text:#eef4ff;--muted:#8fa1b7;--buy:#22d35b;--sell:#ff3b45;--warn:#ffbd2e}
-*{box-sizing:border-box}
-html,body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-body{min-height:100vh}
-.app{width:100%;max-width:560px;margin:0 auto;padding:10px 8px 22px}
-header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 4px 12px}
-h1{font-size:24px;margin:0;font-weight:850;letter-spacing:-.5px}
-.subtitle{font-size:11px;color:var(--muted);margin-top:2px}
-.live{border:1px solid #1db954;color:var(--buy);border-radius:9px;padding:5px 9px;font-weight:800;font-size:12px;white-space:nowrap}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--buy);margin-right:4px}
-.dot.off{background:var(--sell)}
-.card{background:linear-gradient(180deg,#0b1523,#08111c);border:1px solid var(--line);border-radius:9px;margin-bottom:7px;overflow:hidden}
-.metrics{display:grid;grid-template-columns:1fr 1.25fr 1fr;gap:1px;background:var(--line)}
-.metric{background:var(--panel);padding:8px 5px;text-align:center;min-width:0}
-.metric .k{font-size:10px;color:var(--muted)}
-.metric .v{font-size:15px;font-weight:850;margin-top:2px;white-space:nowrap}
-.green{color:var(--buy)}.red{color:var(--sell)}.yellow{color:var(--warn)}
-.status{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;font-size:11px}
-.status strong{font-size:12px}
-.book-head{display:grid;grid-template-columns:1fr 86px 1fr;text-align:center;font-size:11px;font-weight:800}
-.book-head>div{padding:8px 2px;border-bottom:1px solid var(--line)}
-.book-head .bid{color:var(--buy);border-bottom-color:var(--buy)}
-.book-head .ask{color:var(--sell);border-bottom-color:var(--sell)}
-.book{display:grid;grid-template-columns:1fr 86px 1fr}
-.side{min-width:0}
-.row{height:31px;display:grid;align-items:center;position:relative;border-bottom:1px solid #162438;font-size:10px}
-.bid-row{grid-template-columns:46px 1fr;text-align:left}
-.ask-row{grid-template-columns:1fr 46px;text-align:right}
-.row .bar{position:absolute;top:4px;bottom:4px;border-radius:3px;opacity:.42;z-index:0}
-.bid-row .bar{right:2px;background:var(--buy)}
-.ask-row .bar{left:2px;background:var(--sell)}
-.row span{position:relative;z-index:1;padding:0 4px;font-variant-numeric:tabular-nums}
-.qty{font-weight:750}
-.pricecol{display:flex;flex-direction:column;border-left:1px solid var(--line);border-right:1px solid var(--line)}
-.price-row{height:31px;display:flex;align-items:center;justify-content:center;border-bottom:1px solid #162438;font-size:9px;font-weight:800;font-variant-numeric:tabular-nums}
-.price-row.bidp{color:var(--buy)}.price-row.askp{color:var(--sell)}
-.price-gap{height:30px;display:flex;align-items:center;justify-content:center;border-bottom:1px dashed #77869a;font-size:9px;font-weight:900}
-.summary{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line)}
-.summary .metric{padding:9px 5px}
-.balance{padding:9px 10px}
-.balance-top{display:flex;justify-content:space-between;font-size:11px}
-.balancebar{height:11px;background:var(--sell);border-radius:7px;overflow:hidden;margin:6px 0}
-.balancebar .b{height:100%;background:var(--buy)}
-.balance-value{text-align:center;font-weight:900;font-size:15px}
-.small{font-size:10px;color:var(--muted)}
-.section-title{padding:8px 10px;font-weight:850;font-size:12px;border-bottom:1px solid var(--line)}
-.chart{height:120px;padding:8px}
-canvas{width:100%;height:100%}
-.events{padding:5px 9px}
-.event{display:grid;grid-template-columns:50px 1fr auto;gap:5px;padding:6px 0;border-bottom:1px solid #162438;font-size:10px}
-.event:last-child{border-bottom:0}
-.gauge{padding:12px;text-align:center}
-.gauge .score{font-size:25px;font-weight:900}
-.footer{font-size:9px;color:#718096;line-height:1.5;padding:5px 2px}
-@media(max-width:360px){
-  .app{padding-left:5px;padding-right:5px}
-  h1{font-size:21px}
-  .book{grid-template-columns:1fr 76px 1fr}
-  .book-head{grid-template-columns:1fr 76px 1fr}
-  .price-row{font-size:8px}
-  .row{font-size:9px}
-}
+*{box-sizing:border-box}body{margin:0;background:#0b0f14;color:#e8edf3;font-family:system-ui,-apple-system,sans-serif}
+.wrap{max-width:560px;margin:auto;padding:12px}.head{display:flex;justify-content:space-between;align-items:center}
+h1{font-size:20px;margin:4px 0}.status{padding:5px 9px;border-radius:99px;font-size:12px;font-weight:700}
+.live{background:#123d27;color:#55e58a}.caution{background:#463811;color:#ffd45a}.offline{background:#471b20;color:#ff727d}
+.price{text-align:center;font-size:30px;font-weight:800;margin:10px 0 2px}.sub{text-align:center;color:#9aa5b1;font-size:12px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}.panel{background:#111820;border:1px solid #202a34;border-radius:12px;overflow:hidden}
+.title{padding:8px 10px;font-size:13px;font-weight:800}.buy .title{color:#55e58a}.sell .title{color:#ff6875}
+.level{position:relative;padding:7px 8px;border-top:1px solid #1b242d;min-height:48px}
+.bar{position:absolute;top:0;bottom:0;opacity:.22}.buy .bar{right:0;background:#20c66b}.sell .bar{left:0;background:#ef5360}
+.row{position:relative;display:flex;justify-content:space-between;gap:5px;font-size:11px}.qty{font-weight:700}.notional{font-size:10px;color:#9aa5b1;margin-top:4px}
+.info{display:flex;justify-content:space-between;background:#111820;border:1px solid #202a34;border-radius:10px;padding:8px 10px;margin-top:8px;font-size:11px;color:#aeb8c3}
 </style>
 </head>
-<body>
-<div class="app">
-<header>
-  <div>
-    <h1>SHIB Monitor v5.3</h1>
-    <div class="subtitle">リアルタイム板情報モニター（スマホ縦表示）</div>
-  </div>
-  <div id="live" class="live"><span class="dot off"></span>CHECKING</div>
-</header>
-
-<section class="card">
-  <div class="metrics">
-    <div class="metric"><div class="k">ペア</div><div class="v">SHIB/JPY</div></div>
-    <div class="metric"><div class="k">現在価格 (JPY)</div><div id="last" class="v">--</div></div>
-    <div class="metric"><div class="k">直近変動率</div><div id="change" class="v">--</div></div>
-  </div>
-  <div class="status">
-    <div>API <strong id="apiStatus">確認中</strong></div>
-    <div>更新 <strong id="age">--</strong></div>
-  </div>
-</section>
-
-<section class="card">
-  <div class="book-head">
-    <div class="bid">買い板 (BID)</div>
-    <div>価格 (JPY)</div>
-    <div class="ask">売り板 (ASK)</div>
-  </div>
-  <div class="book">
-    <div id="bids" class="side"></div>
-    <div id="prices" class="pricecol"></div>
-    <div id="asks" class="side"></div>
-  </div>
-  <div class="summary">
-    <div class="metric"><div class="k">買い板数量 TOP10</div><div id="bidTotal" class="v green">--</div><div class="small">SHIB</div></div>
-    <div class="metric"><div class="k">売り板数量 TOP10</div><div id="askTotal" class="v red">--</div><div class="small">SHIB</div></div>
-  </div>
-  <div class="balance">
-    <div class="balance-top"><span>板バランス</span><strong id="balanceLabel">--</strong></div>
-    <div class="balancebar"><div id="balanceBar" class="b" style="width:50%"></div></div>
-    <div id="imbalance" class="balance-value">--</div>
-  </div>
-</section>
-
-<section class="card">
-  <div class="summary">
-    <div class="metric"><div class="k">最良買い</div><div id="bestBid" class="v green">--</div></div>
-    <div class="metric"><div class="k">最良売り</div><div id="bestAsk" class="v red">--</div></div>
-    <div class="metric"><div class="k">スプレッド</div><div id="spread" class="v">--</div></div>
-    <div class="metric"><div class="k">ミッド価格</div><div id="mid" class="v">--</div></div>
-  </div>
-</section>
-
-<section class="card">
-  <div class="section-title">板バランス推移</div>
-  <div class="chart"><canvas id="chart"></canvas></div>
-</section>
-
-<section class="card">
-  <div class="section-title">板イベント（直近）</div>
-  <div id="events" class="events"><div class="small">まだありません</div></div>
-</section>
-
-<section class="card">
-  <div class="section-title">板のバランス指標</div>
-  <div class="gauge">
-    <div id="score" class="score">--</div>
-    <div id="scoreLabel">判定待ち</div>
-    <div class="small">+20%以上: 強い買い / +5〜20%: 買い / -5〜+5%: 拮抗 / -20〜-5%: 売り / -20%以下: 強い売り</div>
-  </div>
-</section>
-
-<div class="footer">※本情報は参考情報であり、投資判断を保証するものではありません。板データが30秒以上更新されない場合は判定利用を停止します。</div>
+<body><main class="wrap">
+<div class="head"><h1>SHIB / JPY 板モニター</h1><span id="status" class="status offline">OFFLINE</span></div>
+<div id="price" class="price">--</div><div id="source" class="sub">接続待機中</div>
+<div class="grid">
+<section class="panel buy"><div class="title">買い板</div><div id="bids"></div></section>
+<section class="panel sell"><div class="title">売り板</div><div id="asks"></div></section>
 </div>
-
+<div class="info"><span>最良買い <b id="bid">--</b></span><span>最良売り <b id="ask">--</b></span></div>
+<div class="info"><span>スプレッド <b id="spread">--</b></span><span>更新 <b id="age">--</b></span></div>
+</main>
 <script>
 const $=id=>document.getElementById(id);
-const fmt=(n,d=8)=>Number.isFinite(n)?n.toLocaleString('ja-JP',{maximumFractionDigits:d}):'--';
-const fmtM=n=>Number.isFinite(n)?(n/1e6).toFixed(2)+'M':'--';
-
-function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));}
-
-function renderBook(data){
-  const bids=data.book.bids||[], asks=data.book.asks||[];
-  const max=Math.max(...bids.map(x=>x.amount),...asks.map(x=>x.amount),1);
-  $('bids').innerHTML=bids.map(x=>`<div class="row bid-row"><div class="bar" style="width:${Math.max(3,x.amount/max*96)}%"></div><span class="qty">${fmtM(x.amount)}</span><span class="small"></span></div>`).join('');
-  $('asks').innerHTML=asks.map(x=>`<div class="row ask-row"><div class="bar" style="width:${Math.max(3,x.amount/max*96)}%"></div><span class="small"></span><span class="qty">${fmtM(x.amount)}</span></div>`).join('');
-
-  const gap=Math.max(0,(asks.length-bids.length));
-  let html='';
-  const n=Math.max(bids.length,asks.length);
-  for(let i=0;i<n;i++){
-    if(i<bids.length) html+=`<div class="price-row bidp">${fmt(bids[i].price,10)}</div>`;
-    else if(i===bids.length) html+=`<div class="price-gap">${fmt(data.book.mid,10)}</div>`;
-    else html+='<div class="price-row"></div>';
-  }
-  if(asks.length){
-    const askHtml=asks.map(x=>`<div class="price-row askp">${fmt(x.price,10)}</div>`).join('');
-    html=html.slice(0,0)+bids.map(x=>`<div class="price-row bidp">${fmt(x.price,10)}</div>`).join('')+
-      `<div class="price-gap">${fmt(data.book.mid,10)}</div>`+askHtml;
-  }
-  $('prices').innerHTML=html;
-  $('bidTotal').textContent=fmtM(data.book.bid_total);
-  $('askTotal').textContent=fmtM(data.book.ask_total);
+const fmtPrice=n=>n==null?"--":n.toFixed(8).replace(/0+$/,"").replace(/\.$/,"");
+const fmtQty=n=>n==null?"--":Intl.NumberFormat("ja-JP",{notation:"compact",maximumFractionDigits:2}).format(n);
+function renderLevels(id,levels,side){
+ const el=$(id); el.innerHTML="";
+ const max=Math.max(...levels.map(x=>x.notional),1);
+ levels.forEach(x=>{
+  const d=document.createElement("div");d.className="level";
+  d.innerHTML=`<div class="bar" style="width:${Math.min(100,x.notional/max*100)}%"></div>
+  <div class="row"><span>${fmtPrice(x.price)}</span><span class="qty">${fmtQty(x.amount)}</span></div>
+  <div class="notional">¥${x.notional.toLocaleString("ja-JP",{maximumFractionDigits:0})}</div>`;
+  el.appendChild(d);
+ });
 }
-
-function render(data){
-  const t=data.ticker,b=data.book;
-  $('last').textContent=fmt(t.last,10);
-  $('change').textContent=(data.price_change_pct>=0?'+':'')+fmt(data.price_change_pct,4)+'%';
-  $('change').className='v '+(data.price_change_pct>=0?'green':'red');
-  $('bestBid').textContent=fmt(b.best_bid,10);
-  $('bestAsk').textContent=fmt(b.best_ask,10);
-  $('spread').textContent=fmt(b.spread,10);
-  $('mid').textContent=fmt(b.mid,10);
-  $('imbalance').textContent=(b.imbalance_pct>=0?'+':'')+fmt(b.imbalance_pct,2)+'%';
-  const bidPct=Math.max(0,Math.min(100,(b.imbalance_pct+100)/2));
-  $('balanceBar').style.width=bidPct+'%';
-  $('balanceLabel').textContent=(b.bid_total>=b.ask_total?'買い優勢':'売り優勢');
-  $('apiStatus').textContent=data.fresh?'接続中':'STALE';
-  $('apiStatus').className=data.fresh?'green':'red';
-  $('age').textContent=fmt(data.age_seconds,1)+' 秒';
-  $('live').innerHTML=`<span class="dot ${data.fresh?'':'off'}"></span>${data.fresh?'LIVE':'STALE'}`;
-  const s=b.imbalance_pct;
-  $('score').textContent=(s>=0?'+':'')+fmt(s,2)+'%';
-  $('score').className='score '+(s>=0?'green':'red');
-  $('scoreLabel').textContent=s>=20?'強い買い優勢':s>=5?'買い優勢':s>-5?'拮抗':s>-20?'売り優勢':'強い売り優勢';
-  renderBook(data);
-  $('events').innerHTML=(data.events||[]).map(e=>`<div class="event"><span>${esc(e.time)}</span><span class="${e.side==='buy'?'green':'red'}">${esc(e.label)}</span><strong>${e.delta>=0?'+':''}${fmtM(Math.abs(e.delta))}</strong></div>`).join('')||'<div class="small">変化を検出中</div>';
-  drawChart(data.history||[]);
+function render(s){
+ window.lastTs=Date.now();
+ $("price").textContent=fmtPrice(s.price);
+ $("bid").textContent=fmtPrice(s.best_bid); $("ask").textContent=fmtPrice(s.best_ask);
+ $("spread").textContent=s.spread_pct==null?"--":s.spread_pct.toFixed(3)+"%";
+ $("source").textContent=(s.source==="coincheck_ws"?"● WebSocket LIVE":"● REST fallback");
+ $("status").textContent=s.freshness;
+ $("status").className="status "+s.freshness.toLowerCase();
+ renderLevels("bids",s.bids,"bid");renderLevels("asks",s.asks,"ask");
 }
-
-function drawChart(history){
-  const c=$('chart'),r=c.getBoundingClientRect(),d=devicePixelRatio||1;
-  c.width=Math.max(1,Math.floor(r.width*d));c.height=Math.max(1,Math.floor(r.height*d));
-  const ctx=c.getContext('2d');ctx.setTransform(d,0,0,d,0,0);
-  const w=r.width,h=r.height,p=8;
-  ctx.clearRect(0,0,w,h);
-  if(history.length<2){ctx.fillStyle='#718096';ctx.fillText('板バランス履歴を収集中…',p,25);return}
-  const a=history.slice(-120), vals=a.map(x=>x.imbalance);
-  const min=Math.min(-100,...vals),max=Math.max(100,...vals),range=max-min||1;
-  ctx.strokeStyle='#24364d';ctx.lineWidth=1;
-  for(let i=0;i<5;i++){const y=p+(h-2*p)*i/4;ctx.beginPath();ctx.moveTo(p,y);ctx.lineTo(w-p,y);ctx.stroke()}
-  ctx.strokeStyle='#607086';ctx.setLineDash([4,4]);
-  const y0=p+(h-2*p)*(0-min)/range;ctx.beginPath();ctx.moveTo(p,y0);ctx.lineTo(w-p,y0);ctx.stroke();ctx.setLineDash([]);
-  ctx.strokeStyle='#22d35b';ctx.lineWidth=2;ctx.beginPath();
-  vals.forEach((v,i)=>{const x=p+(w-2*p)*i/(vals.length-1);const y=p+(h-2*p)*(max-v)/range;i?ctx.lineTo(x,y):ctx.moveTo(x,y)});
-  ctx.stroke();
+function connect(){
+ const proto=location.protocol==="https:"?"wss":"ws";
+ const ws=new WebSocket(`${proto}://${location.host}/ws`);
+ ws.onmessage=e=>render(JSON.parse(e.data));
+ ws.onclose=()=>setTimeout(connect,2000);
 }
-
-async function load(){
-  try{
-    const r=await fetch('/api/orderbook',{cache:'no-store'});
-    const data=await r.json();
-    if(!r.ok || !data.book){throw new Error(data.error||'データ取得失敗')}
-    render(data);
-  }catch(e){
-    $('apiStatus').textContent='ERROR';$('apiStatus').className='red';
-    $('live').innerHTML='<span class="dot off"></span>ERROR';
-    $('age').textContent='--';
-  }
-}
-load();setInterval(load,1000);
-window.addEventListener('resize',()=>{const x=$('chart'); if(x) drawChart([])});
+connect();
+setInterval(()=>{ if(window.lastTs) $("age").textContent=((Date.now()-window.lastTs)/1000).toFixed(1)+"s";},500);
 </script>
-</body>
-</html>
+</body></html>
