@@ -8,7 +8,7 @@ import aiohttp
 LOG = logging.getLogger(__name__)
 
 REST = "https://coincheck.com"
-WS = "wss://ws-api.coincheck.com/"
+WS = "wss://ws-api.coincheck.com"
 VERSION = "5.4"
 
 
@@ -84,7 +84,7 @@ class CoincheckStream:
                         if last is not None:
                             # Keep compatibility with existing analyzer versions.
                             try:
-                                self.analyzer.price = float(last)
+                                self.analyzer.last_price = float(last)
                             except Exception:
                                 pass
                 except Exception:
@@ -250,6 +250,12 @@ class CoincheckStream:
                             f"{self.pair}-trades",
                         )
 
+                        LOG.info(
+                            "Coincheck subscriptions complete: %s-orderbook, %s-trades",
+                            self.pair,
+                            self.pair,
+                        )
+
                         watchdog_task = asyncio.create_task(
                             self._watchdog(ws)
                         )
@@ -382,15 +388,32 @@ class CoincheckStream:
 
             finally:
                 self.connected = False
+                # Keep a useful reason even when the server closes the socket
+                # cleanly (which does not raise an exception in aiohttp).
                 try:
-                    LOG.warning(
-                        "Coincheck WebSocket session ended "
-                        "last_error=%r ws_connected=%s",
-                        self.last_error,
-                        self.connected,
-                    )
+                    if "ws" in locals():
+                        LOG.warning(
+                            "Coincheck WebSocket session ended "
+                            "closed=%s close_code=%s exception=%r "
+                            "last_error=%r",
+                            ws.closed,
+                            ws.close_code,
+                            ws.exception(),
+                            self.last_error,
+                        )
+                        if self.last_error is None and ws.closed:
+                            self.last_error = (
+                                f"WebSocketClosed: code={ws.close_code!r} "
+                                f"exception={ws.exception()!r}"
+                            )
+                    else:
+                        LOG.warning(
+                            "Coincheck WebSocket session ended before ws object "
+                            "was created; last_error=%r",
+                            self.last_error,
+                        )
                 except Exception:
-                    pass
+                    LOG.exception("failed to inspect WebSocket close state")
 
             LOG.warning(
                 "Coincheck WebSocket disconnected; reconnecting in 3 seconds"
