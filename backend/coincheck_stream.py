@@ -318,14 +318,28 @@ class CoincheckStream:
                                         )
                                         continue
 
-                                    # Official Coincheck orderbook shape:
-                                    # ["shib_jpy-orderbook", {...}]
+                                    # Coincheck may deliver the orderbook using
+                                    # the pair name itself (for example
+                                    # ["shib_jpy", {"bids": [...], "asks": [...]}])
+                                    # rather than the documented -orderbook
+                                    # suffix. Accept both forms.
                                     if (
                                         isinstance(data, list)
                                         and len(data) == 2
-                                        and data[0]
-                                        == f"{self.pair}-orderbook"
+                                        and data[0] in (
+                                            self.pair,
+                                            f"{self.pair}-orderbook",
+                                        )
+                                        and isinstance(data[1], dict)
+                                        and (
+                                            "bids" in data[1]
+                                            or "asks" in data[1]
+                                        )
                                     ):
+                                        LOG.info(
+                                            "recognized orderbook channel=%s",
+                                            data[0],
+                                        )
                                         await self._handle_orderbook(data[1])
                                         continue
 
