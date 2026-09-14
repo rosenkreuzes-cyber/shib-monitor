@@ -113,60 +113,29 @@ class CoincheckStream:
         LOG.info("Coincheck subscribe sent: %s", channel)
 
     async def _watchdog(self, ws):
+        # Diagnostic mode: do not force-close a healthy WebSocket merely
+        # because orderbook updates are temporarily sparse. aiohttp heartbeat
+        # handles the connection liveness; the main receive loop handles
+        # actual close/error events.
         while not ws.closed:
-            await asyncio.sleep(5)
-
-            now = self._now()
-
-            ws_age = (
-                now - self.last_ws_message_ts
-                if self.last_ws_message_ts is not None
-                else None
-            )
-
-            orderbook_age = (
-                now - self.last_ws_orderbook_ts
-                if self.last_ws_orderbook_ts is not None
-                else None
-            )
-
+            await asyncio.sleep(15)
             LOG.debug(
                 "watchdog pair=%s ws_age=%s orderbook_age=%s "
                 "ws_messages=%d orderbook_messages=%d trade_messages=%d",
                 self.pair,
-                ws_age,
-                orderbook_age,
+                (
+                    self._now() - self.last_ws_message_ts
+                    if self.last_ws_message_ts is not None else None
+                ),
+                (
+                    self._now() - self.last_ws_orderbook_ts
+                    if self.last_ws_orderbook_ts is not None else None
+                ),
                 self.ws_messages,
                 self.ws_orderbook_messages,
                 self.ws_trade_messages,
             )
 
-            # A TCP/WebSocket connection can remain open without receiving
-            # market data. Reconnect if no orderbook frame has arrived.
-            if orderbook_age is None:
-                if ws_age is not None and ws_age > 20:
-                    LOG.warning(
-                        "websocket connected but no orderbook message "
-                        "received for %.1fs; reconnecting",
-                        ws_age,
-                    )
-                    await ws.close(
-                        code=1012,
-                        message=b"no orderbook data",
-                    )
-                    return
-                continue
-
-            if orderbook_age > 30:
-                LOG.warning(
-                    "orderbook websocket stale %.1fs; forcing websocket reconnect",
-                    orderbook_age,
-                )
-                await ws.close(
-                    code=1012,
-                    message=b"orderbook stale",
-                )
-                return
 
     async def _handle_orderbook(self, payload):
         if not isinstance(payload, dict):
@@ -367,9 +336,14 @@ class CoincheckStream:
                                     )
 
                                 elif msg.type == aiohttp.WSMsgType.ERROR:
+                                    self.last_error = repr(ws.exception())
                                     LOG.error(
-                                        "Coincheck WebSocket error: %s",
+                                        "Coincheck WebSocket ERROR "
+                                        "type=%s exception=%r close_code=%r",
+                                        type(ws.exception()).__name__
+                                        if ws.exception() else None,
                                         ws.exception(),
+                                        ws.close_code,
                                     )
                                     break
 
@@ -379,8 +353,11 @@ class CoincheckStream:
                                     aiohttp.WSMsgType.CLOSING,
                                 ):
                                     LOG.warning(
-                                        "Coincheck WebSocket closed type=%s",
+                                        "Coincheck WebSocket CLOSED "
+                                        "type=%s close_code=%r exception=%r",
                                         msg.type,
+                                        ws.close_code,
+                                        ws.exception(),
                                     )
                                     break
 
@@ -395,14 +372,25 @@ class CoincheckStream:
                 raise
 
             except Exception as exc:
-                self.last_error = str(exc)
+                self.last_error = f"{type(exc).__name__}: {exc!r}"
                 LOG.exception(
-                    "Coincheck WebSocket loop failed: %s",
+                    "Coincheck WebSocket loop failed "
+                    "type=%s repr=%r",
+                    type(exc).__name__,
                     exc,
                 )
 
             finally:
                 self.connected = False
+                try:
+                    LOG.warning(
+                        "Coincheck WebSocket session ended "
+                        "last_error=%r ws_connected=%s",
+                        self.last_error,
+                        self.connected,
+                    )
+                except Exception:
+                    pass
 
             LOG.warning(
                 "Coincheck WebSocket disconnected; reconnecting in 3 seconds"
