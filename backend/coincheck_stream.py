@@ -201,221 +201,251 @@ class CoincheckStream:
             # controls orderbook freshness/decision validity.
             await self.broadcast()
 
+    async def _rest_fallback_loop(self):
+        """Refresh REST data only when WebSocket data is unavailable/stale."""
+        while True:
+            try:
+                await asyncio.sleep(5)
+                now = self._now()
+                ws_age = (
+                    now - self.last_ws_orderbook_ts
+                    if self.last_ws_orderbook_ts is not None
+                    else None
+                )
+                if (not self.connected) or ws_age is None or ws_age > 8:
+                    LOG.warning(
+                        "REST fallback refresh pair=%s connected=%s ws_orderbook_age=%s",
+                        self.pair, self.connected, ws_age,
+                    )
+                    await self.rest_snapshot()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("REST fallback loop failed")
+
     async def run(self):
         """
         Reconnecting Coincheck WebSocket loop.
         Compatible with main.py's await stream.run().
         """
-        while True:
-            try:
-                timeout = aiohttp.ClientTimeout(total=None)
+        fallback_task = asyncio.create_task(self._rest_fallback_loop())
+        try:
+            while True:
+                try:
+                    timeout = aiohttp.ClientTimeout(total=None)
 
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    LOG.info(
-                        "connecting Coincheck WebSocket: %s",
-                        WS,
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        LOG.info(
+                            "connecting Coincheck WebSocket: %s",
+                            WS,
+                        )
+
+                        async with session.ws_connect(
+                            WS,
+                            heartbeat=20,
+                            autoping=True,
+                            receive_timeout=None,
+                        ) as ws:
+                            self.connected = True
+                            self.last_error = None
+                            self.last_ws_message_ts = None
+                            self.last_ws_orderbook_ts = None
+                            self._debug_raw_messages = 0
+
+                            LOG.info("Coincheck WebSocket connected")
+
+                            # Load REST snapshot before consuming WebSocket diffs.
+                            # This initializes the local book even when the first WS
+                            # frame is a partial/difference update.
+                            await self.rest_snapshot()
+
+                            # Coincheck public API uses one subscribe command
+                            # per channel.
+                            await self._subscribe(
+                                ws,
+                                f"{self.pair}-orderbook",
+                            )
+
+                            # Give orderbook subscription a small head start.
+                            await asyncio.sleep(0.2)
+
+                            await self._subscribe(
+                                ws,
+                                f"{self.pair}-trades",
+                            )
+
+                            LOG.info(
+                                "Coincheck subscriptions complete: %s-orderbook, %s-trades",
+                                self.pair,
+                                self.pair,
+                            )
+
+                            watchdog_task = asyncio.create_task(
+                                self._watchdog(ws)
+                            )
+
+                            try:
+                                async for msg in ws:
+                                    self.ws_messages += 1
+                                    self.last_ws_message_ts = self._now()
+
+                                    # Diagnostic: expose the first frames exactly as
+                                    # received. This is the key test for the current
+                                    # "connected but 0 messages" problem.
+                                    if (
+                                        self._debug_raw_messages
+                                        < self._debug_raw_limit
+                                    ):
+                                        self._debug_raw_messages += 1
+                                        raw = msg.data
+
+                                        if isinstance(raw, bytes):
+                                            raw = raw.decode(
+                                                "utf-8",
+                                                "replace",
+                                            )
+
+                                        LOG.warning(
+                                            "WS RAW #%d type=%s data=%s",
+                                            self._debug_raw_messages,
+                                            msg.type,
+                                            raw,
+                                        )
+
+                                    if msg.type == aiohttp.WSMsgType.TEXT:
+                                        try:
+                                            data = json.loads(msg.data)
+                                        except json.JSONDecodeError:
+                                            LOG.warning(
+                                                "WS JSON decode failed: %r",
+                                                msg.data,
+                                            )
+                                            continue
+
+                                        # Coincheck may deliver the orderbook using
+                                        # the pair name itself (for example
+                                        # ["shib_jpy", {"bids": [...], "asks": [...]}])
+                                        # rather than the documented -orderbook
+                                        # suffix. Accept both forms.
+                                        if (
+                                            isinstance(data, list)
+                                            and len(data) == 2
+                                            and data[0] in (
+                                                self.pair,
+                                                f"{self.pair}-orderbook",
+                                            )
+                                            and isinstance(data[1], dict)
+                                            and (
+                                                "bids" in data[1]
+                                                or "asks" in data[1]
+                                            )
+                                        ):
+                                            LOG.info(
+                                                "recognized orderbook channel=%s",
+                                                data[0],
+                                            )
+                                            await self._handle_orderbook(data[1])
+                                            continue
+
+                                        # Official Coincheck trades shape:
+                                        # ["shib_jpy-trades", [[...], ...]]
+                                        if (
+                                            isinstance(data, list)
+                                            and len(data) == 2
+                                            and data[0]
+                                            == f"{self.pair}-trades"
+                                        ):
+                                            await self._handle_trade(data[1])
+                                            continue
+
+                                        # Subscription acknowledgements/errors and
+                                        # unexpected frames must remain visible.
+                                        LOG.warning(
+                                            "WS unrecognized message: %r",
+                                            data,
+                                        )
+
+                                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                                        self.last_error = repr(ws.exception())
+                                        LOG.error(
+                                            "Coincheck WebSocket ERROR "
+                                            "type=%s exception=%r close_code=%r",
+                                            type(ws.exception()).__name__
+                                            if ws.exception() else None,
+                                            ws.exception(),
+                                            ws.close_code,
+                                        )
+                                        break
+
+                                    elif msg.type in (
+                                        aiohttp.WSMsgType.CLOSED,
+                                        aiohttp.WSMsgType.CLOSE,
+                                        aiohttp.WSMsgType.CLOSING,
+                                    ):
+                                        LOG.warning(
+                                            "Coincheck WebSocket CLOSED "
+                                            "type=%s close_code=%r exception=%r",
+                                            msg.type,
+                                            ws.close_code,
+                                            ws.exception(),
+                                        )
+                                        break
+
+                            finally:
+                                watchdog_task.cancel()
+                                try:
+                                    await watchdog_task
+                                except asyncio.CancelledError:
+                                    pass
+
+                except asyncio.CancelledError:
+                    raise
+
+                except Exception as exc:
+                    self.last_error = f"{type(exc).__name__}: {exc!r}"
+                    LOG.exception(
+                        "Coincheck WebSocket loop failed "
+                        "type=%s repr=%r",
+                        type(exc).__name__,
+                        exc,
                     )
 
-                    async with session.ws_connect(
-                        WS,
-                        heartbeat=20,
-                        autoping=True,
-                        receive_timeout=None,
-                    ) as ws:
-                        self.connected = True
-                        self.last_error = None
-                        self.last_ws_message_ts = None
-                        self.last_ws_orderbook_ts = None
-                        self._debug_raw_messages = 0
-
-                        LOG.info("Coincheck WebSocket connected")
-
-                        # Load REST snapshot before consuming WebSocket diffs.
-                        # This initializes the local book even when the first WS
-                        # frame is a partial/difference update.
-                        await self.rest_snapshot()
-
-                        # Coincheck public API uses one subscribe command
-                        # per channel.
-                        await self._subscribe(
-                            ws,
-                            f"{self.pair}-orderbook",
-                        )
-
-                        # Give orderbook subscription a small head start.
-                        await asyncio.sleep(0.2)
-
-                        await self._subscribe(
-                            ws,
-                            f"{self.pair}-trades",
-                        )
-
-                        LOG.info(
-                            "Coincheck subscriptions complete: %s-orderbook, %s-trades",
-                            self.pair,
-                            self.pair,
-                        )
-
-                        watchdog_task = asyncio.create_task(
-                            self._watchdog(ws)
-                        )
-
-                        try:
-                            async for msg in ws:
-                                self.ws_messages += 1
-                                self.last_ws_message_ts = self._now()
-
-                                # Diagnostic: expose the first frames exactly as
-                                # received. This is the key test for the current
-                                # "connected but 0 messages" problem.
-                                if (
-                                    self._debug_raw_messages
-                                    < self._debug_raw_limit
-                                ):
-                                    self._debug_raw_messages += 1
-                                    raw = msg.data
-
-                                    if isinstance(raw, bytes):
-                                        raw = raw.decode(
-                                            "utf-8",
-                                            "replace",
-                                        )
-
-                                    LOG.warning(
-                                        "WS RAW #%d type=%s data=%s",
-                                        self._debug_raw_messages,
-                                        msg.type,
-                                        raw,
-                                    )
-
-                                if msg.type == aiohttp.WSMsgType.TEXT:
-                                    try:
-                                        data = json.loads(msg.data)
-                                    except json.JSONDecodeError:
-                                        LOG.warning(
-                                            "WS JSON decode failed: %r",
-                                            msg.data,
-                                        )
-                                        continue
-
-                                    # Coincheck may deliver the orderbook using
-                                    # the pair name itself (for example
-                                    # ["shib_jpy", {"bids": [...], "asks": [...]}])
-                                    # rather than the documented -orderbook
-                                    # suffix. Accept both forms.
-                                    if (
-                                        isinstance(data, list)
-                                        and len(data) == 2
-                                        and data[0] in (
-                                            self.pair,
-                                            f"{self.pair}-orderbook",
-                                        )
-                                        and isinstance(data[1], dict)
-                                        and (
-                                            "bids" in data[1]
-                                            or "asks" in data[1]
-                                        )
-                                    ):
-                                        LOG.info(
-                                            "recognized orderbook channel=%s",
-                                            data[0],
-                                        )
-                                        await self._handle_orderbook(data[1])
-                                        continue
-
-                                    # Official Coincheck trades shape:
-                                    # ["shib_jpy-trades", [[...], ...]]
-                                    if (
-                                        isinstance(data, list)
-                                        and len(data) == 2
-                                        and data[0]
-                                        == f"{self.pair}-trades"
-                                    ):
-                                        await self._handle_trade(data[1])
-                                        continue
-
-                                    # Subscription acknowledgements/errors and
-                                    # unexpected frames must remain visible.
-                                    LOG.warning(
-                                        "WS unrecognized message: %r",
-                                        data,
-                                    )
-
-                                elif msg.type == aiohttp.WSMsgType.ERROR:
-                                    self.last_error = repr(ws.exception())
-                                    LOG.error(
-                                        "Coincheck WebSocket ERROR "
-                                        "type=%s exception=%r close_code=%r",
-                                        type(ws.exception()).__name__
-                                        if ws.exception() else None,
-                                        ws.exception(),
-                                        ws.close_code,
-                                    )
-                                    break
-
-                                elif msg.type in (
-                                    aiohttp.WSMsgType.CLOSED,
-                                    aiohttp.WSMsgType.CLOSE,
-                                    aiohttp.WSMsgType.CLOSING,
-                                ):
-                                    LOG.warning(
-                                        "Coincheck WebSocket CLOSED "
-                                        "type=%s close_code=%r exception=%r",
-                                        msg.type,
-                                        ws.close_code,
-                                        ws.exception(),
-                                    )
-                                    break
-
-                        finally:
-                            watchdog_task.cancel()
-                            try:
-                                await watchdog_task
-                            except asyncio.CancelledError:
-                                pass
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as exc:
-                self.last_error = f"{type(exc).__name__}: {exc!r}"
-                LOG.exception(
-                    "Coincheck WebSocket loop failed "
-                    "type=%s repr=%r",
-                    type(exc).__name__,
-                    exc,
-                )
-
-            finally:
-                self.connected = False
-                # Keep a useful reason even when the server closes the socket
-                # cleanly (which does not raise an exception in aiohttp).
-                try:
-                    if "ws" in locals():
-                        LOG.warning(
-                            "Coincheck WebSocket session ended "
-                            "closed=%s close_code=%s exception=%r "
-                            "last_error=%r",
-                            ws.closed,
-                            ws.close_code,
-                            ws.exception(),
-                            self.last_error,
-                        )
-                        if self.last_error is None and ws.closed:
-                            self.last_error = (
-                                f"WebSocketClosed: code={ws.close_code!r} "
-                                f"exception={ws.exception()!r}"
+                finally:
+                    self.connected = False
+                    # Keep a useful reason even when the server closes the socket
+                    # cleanly (which does not raise an exception in aiohttp).
+                    try:
+                        if "ws" in locals():
+                            LOG.warning(
+                                "Coincheck WebSocket session ended "
+                                "closed=%s close_code=%s exception=%r "
+                                "last_error=%r",
+                                ws.closed,
+                                ws.close_code,
+                                ws.exception(),
+                                self.last_error,
                             )
-                    else:
-                        LOG.warning(
-                            "Coincheck WebSocket session ended before ws object "
-                            "was created; last_error=%r",
-                            self.last_error,
-                        )
-                except Exception:
-                    LOG.exception("failed to inspect WebSocket close state")
+                            if self.last_error is None and ws.closed:
+                                self.last_error = (
+                                    f"WebSocketClosed: code={ws.close_code!r} "
+                                    f"exception={ws.exception()!r}"
+                                )
+                        else:
+                            LOG.warning(
+                                "Coincheck WebSocket session ended before ws object "
+                                "was created; last_error=%r",
+                                self.last_error,
+                            )
+                    except Exception:
+                        LOG.exception("failed to inspect WebSocket close state")
 
-            LOG.warning(
-                "Coincheck WebSocket disconnected; reconnecting in 3 seconds"
-            )
-            await asyncio.sleep(3)
+                LOG.warning(
+                    "Coincheck WebSocket disconnected; reconnecting in 3 seconds"
+                )
+                await asyncio.sleep(3)
+        finally:
+            fallback_task.cancel()
+            try:
+                await fallback_task
+            except asyncio.CancelledError:
+                pass
