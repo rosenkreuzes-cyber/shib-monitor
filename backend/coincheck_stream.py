@@ -251,7 +251,7 @@ class CoincheckStream:
                         WS,
                         heartbeat=20,
                         autoping=True,
-                        receive_timeout=15,
+                        receive_timeout=None,
                     ) as ws:
                         self.connected = True
                         self.last_error = None
@@ -260,6 +260,11 @@ class CoincheckStream:
                         self._debug_raw_messages = 0
 
                         LOG.info("Coincheck WebSocket connected")
+
+                        # Load REST snapshot before consuming WebSocket diffs.
+                        # This initializes the local book even when the first WS
+                        # frame is a partial/difference update.
+                        await self.rest_snapshot()
 
                         # Coincheck public API uses one subscribe command
                         # per channel.
