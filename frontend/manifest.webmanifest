@@ -1,1 +1,8 @@
-{"name":"SHIB/JPY OrderFlow","short_name":"SHIB OrderFlow","start_url":"./","display":"standalone","background_color":"#070c13","theme_color":"#0b111b","lang":"ja"}
+{
+  "name": "SHIB/JPY OrderFlow",
+  "short_name": "SHIB OrderFlow",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#111",
+  "theme_color": "#111"
+}
