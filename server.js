@@ -12,6 +12,7 @@ const REST_POLL_MS = 5000;
 const WS_STALE_MS = 15000;
 const RECONNECT_MS = 3000;
 const MAX_LEVELS = 10;
+const MIN_DEPTH_LEVELS = 2;
 
 const app = express();
 app.use((req, res, next) => {
@@ -24,11 +25,12 @@ let state = {
   status: "ok",
   service: "shib-monitor-api",
   version: "5.4",
+  build: "2nd-integrity-final",
   pair: DISPLAY_PAIR,
   price: null,
-  price_change_pct: null,
   source: "unknown",
-  ws_connected: false,
+  ws_connected: false,          // true only after a valid WS orderbook message
+  ws_transport_connected: false,
   ws_stale: false,
   freshness: "UNKNOWN",
   last_data_received_ts: null,
@@ -55,6 +57,7 @@ let state = {
     last_update_ts: null,
     snapshot_age_sec: null,
     price_in_book: null,
+    last_in_ticker_range: null,
     ticker_book_consistent: null,
     integrity_ok: false,
     integrity_reason: "データ未取得",
@@ -63,12 +66,7 @@ let state = {
     ticker_bid: null,
     ticker_ask: null
   },
-  trade_flow: {
-    buy_pct: null,
-    sell_pct: null,
-    buy: 0,
-    sell: 0
-  },
+  trade_flow: { buy_pct: null, sell_pct: null, buy: 0, sell: 0 },
   score_usable: false,
   score: null,
   label: "判定停止",
@@ -89,15 +87,14 @@ function finiteNumber(v) {
 
 function cleanLevels(levels, side) {
   if (!Array.isArray(levels)) return [];
-  return levels
-    .map(x => {
-      const p = finiteNumber(x?.[0]);
-      const q = finiteNumber(x?.[1]);
-      if (p == null || q == null || p <= 0 || q <= 0) return null;
-      return { price: p, amount: q, notional: p * q, side };
-    })
-    .filter(Boolean)
-    .sort((a, b) => side === "bid" ? b.price - a.price : a.price - b.price);
+  return levels.map(x => {
+    const p = finiteNumber(x?.[0]);
+    const q = finiteNumber(x?.[1]);
+    if (p == null || q == null || p <= 0 || q <= 0) return null;
+    return { price: p, amount: q, notional: p * q, side };
+  }).filter(Boolean).sort((a,b) =>
+    side === "bid" ? b.price - a.price : a.price - b.price
+  );
 }
 
 function mapsFromSnapshot(bids, asks) {
@@ -119,69 +116,92 @@ function applyDelta(sideMap, levels) {
 }
 
 function topLevels(map, side) {
-  return [...map.entries()]
-    .map(([price, amount]) => ({ price, amount, notional: price * amount, side }))
-    .sort((a, b) => side === "bid" ? b.price - a.price : a.price - b.price)
-    .slice(0, MAX_LEVELS);
+  return [...map.entries()].map(([price, amount]) => ({
+    price, amount, notional: price * amount, side
+  })).sort((a,b) =>
+    side === "bid" ? b.price - a.price : a.price - b.price
+  ).slice(0, MAX_LEVELS);
 }
 
-function computeBook() {
-  const bids = topLevels(rawBook.bids, "bid");
-  const asks = topLevels(rawBook.asks, "ask");
+function bookMetrics(book) {
+  const bids = topLevels(book.bids, "bid");
+  const asks = topLevels(book.asks, "ask");
   const bestBid = bids[0]?.price ?? null;
   const bestAsk = asks[0]?.price ?? null;
   const validSpread = bestBid != null && bestAsk != null && bestBid < bestAsk;
+  return { bids, asks, bestBid, bestAsk, validSpread };
+}
+
+function computeBook() {
+  const m = bookMetrics(rawBook);
+  const { bids, asks, bestBid, bestAsk, validSpread } = m;
   const mid = validSpread ? (bestBid + bestAsk) / 2 : null;
   const spreadPct = validSpread ? ((bestAsk - bestBid) / bestBid) * 100 : null;
-  const bidWeight = bids.reduce((s, x) => s + x.notional, 0);
-  const askWeight = asks.reduce((s, x) => s + x.notional, 0);
+  const bidWeight = bids.reduce((s,x) => s + x.notional, 0);
+  const askWeight = asks.reduce((s,x) => s + x.notional, 0);
   const totalWeight = bidWeight + askWeight;
   const imbalancePct = totalWeight > 0 ? (bidWeight / totalWeight) * 100 : null;
 
-  state.book.best_bid = bestBid;
-  state.book.best_ask = bestAsk;
-  state.book.mid = mid;
-  state.book.spread_pct = spreadPct;
-  state.book.imbalance_pct = imbalancePct;
-  state.book.weighted_bid = bidWeight;
-  state.book.weighted_ask = askWeight;
-  state.book.bid_levels = bids.length;
-  state.book.ask_levels = asks.length;
-  state.book.bids_top10 = bids;
-  state.book.asks_top10 = asks;
-  state.book.ready = validSpread;
-
-  return { bids, asks, bestBid, bestAsk, mid, validSpread };
+  Object.assign(state.book, {
+    best_bid: bestBid, best_ask: bestAsk, mid,
+    spread_pct: spreadPct, imbalance_pct: imbalancePct,
+    weighted_bid: bidWeight, weighted_ask: askWeight,
+    bid_levels: bids.length, ask_levels: asks.length,
+    bids_top10: bids, asks_top10: asks,
+    ready: validSpread
+  });
+  return m;
 }
 
 function updateConsistency() {
   const b = state.book;
   const price = state.price;
   const hasBook = b.best_bid != null && b.best_ask != null && b.best_bid < b.best_ask;
-  b.price_in_book = hasBook && price != null ? price >= b.best_bid && price <= b.best_ask : null;
+
+  b.price_in_book = hasBook && price != null
+    ? price >= b.best_bid && price <= b.best_ask : null;
 
   const tb = finiteNumber(lastTicker?.bid);
   const ta = finiteNumber(lastTicker?.ask);
   const tl = finiteNumber(lastTicker?.last);
   b.ticker_last = tl; b.ticker_bid = tb; b.ticker_ask = ta;
-  b.ticker_book_consistent = hasBook && tb != null && ta != null ? tb > 0 && ta > 0 && tb <= ta : null;
-  b.depth_sufficient = b.bid_levels >= 2 && b.ask_levels >= 2;
-  b.integrity_ok = hasBook && b.price_in_book === true && b.ticker_book_consistent === true && b.depth_sufficient;
 
-  if (!hasBook) b.integrity_reason = "BID/ASK不整合または片側欠落";
-  else if (b.price_in_book !== true) b.integrity_reason = `現在価格 ${price ?? "--"} がBID/ASK範囲外`;
-  else if (b.ticker_book_consistent !== true) b.integrity_reason = "Ticker BID/ASK不整合";
-  else if (!b.depth_sufficient) b.integrity_reason = `板の段数不足 (${b.bid_levels}/${b.ask_levels})`;
-  else b.integrity_reason = "OK";
+  const tickerValid = tb != null && ta != null && tb > 0 && ta > 0 && tb <= ta;
+  b.last_in_ticker_range = tickerValid && tl != null ? tl >= tb && tl <= ta : null;
+
+  // "ticker_book_consistent" means the two quote ranges overlap.
+  // It does not require exact equality because REST snapshots can be taken at different instants.
+  b.ticker_book_consistent = hasBook && tickerValid
+    ? tb <= b.best_ask && ta >= b.best_bid : null;
+
+  b.depth_sufficient = b.bid_levels >= MIN_DEPTH_LEVELS && b.ask_levels >= MIN_DEPTH_LEVELS;
+
+  b.integrity_ok =
+    hasBook &&
+    b.price_in_book === true &&
+    b.last_in_ticker_range !== false &&
+    b.ticker_book_consistent === true &&
+    b.depth_sufficient;
+
+  if (!hasBook) {
+    b.integrity_reason = "BID/ASK不整合または片側欠落";
+  } else if (b.price_in_book !== true) {
+    b.integrity_reason = `現在価格 ${price ?? "--"} がBID/ASK範囲外`;
+  } else if (b.ticker_book_consistent !== true) {
+    b.integrity_reason = "TickerとOrderBookの価格帯が不整合";
+  } else if (b.last_in_ticker_range === false) {
+    b.integrity_reason = "Ticker lastがTicker BID/ASK範囲外";
+  } else if (!b.depth_sufficient) {
+    b.integrity_reason = `板の段数不足 (${b.bid_levels}/${b.ask_levels})`;
+  } else {
+    b.integrity_reason = "OK";
+  }
 }
 
 function calculateScore() {
   const b = state.book;
   const fresh = state.freshness === "LIVE" || state.freshness === "CAUTION";
-  const enoughBook = b.ready && b.bid_levels > 0 && b.ask_levels > 0;
-  const priceOK = b.price_in_book === true;
-
-  if (!fresh || !enoughBook || !priceOK || !b.integrity_ok || b.imbalance_pct == null) {
+  if (!fresh || !b.integrity_ok || b.imbalance_pct == null) {
     state.score_usable = false;
     state.score = null;
     state.label = "判定停止";
@@ -189,8 +209,6 @@ function calculateScore() {
     return;
   }
 
-  // 0-100: book imbalance is the primary measurable component.
-  // The remaining components are intentionally small and transparent.
   const imbalance = Math.max(0, Math.min(100, b.imbalance_pct));
   const spreadComponent = b.spread_pct == null ? 50 : Math.max(0, Math.min(100, 100 - b.spread_pct * 100));
   const freshnessComponent = state.freshness === "LIVE" ? 100 : 70;
@@ -233,43 +251,39 @@ async function loadRest(source = "rest_poll") {
     }
 
     const next = mapsFromSnapshot(bookData.bids, bookData.asks);
-    const testBids = topLevels(next.bids, "bid");
-    const testAsks = topLevels(next.asks, "ask");
-    const testBid = testBids[0]?.price ?? null;
-    const testAsk = testAsks[0]?.price ?? null;
+    const test = bookMetrics(next);
 
-    // Never replace a good book with a crossed/inverted snapshot.
-    if (testBid == null || testAsk == null || testBid >= testAsk) {
-      throw new Error(`REST book integrity error: bid=${testBid} ask=${testAsk}`);
+    if (!test.validSpread) {
+      throw new Error(`REST book integrity error: bid=${test.bestBid} ask=${test.bestAsk}`);
     }
 
     const tickerLast = finiteNumber(tickerData?.last);
     const tickerBid = finiteNumber(tickerData?.bid);
     const tickerAsk = finiteNumber(tickerData?.ask);
-    if (tickerLast == null || tickerBid == null || tickerAsk == null || tickerBid <= 0 || tickerAsk <= 0 || tickerBid > tickerAsk) {
+    if (tickerLast == null || tickerBid == null || tickerAsk == null ||
+        tickerBid <= 0 || tickerAsk <= 0 || tickerBid > tickerAsk) {
       throw new Error("REST ticker integrity error");
     }
 
+    // Commit book + ticker atomically only after both payloads pass basic validation.
     rawBook = next;
-    lastTicker = tickerData || null;
+    lastTicker = tickerData;
     state.price = tickerLast;
     state.source = "coincheck_rest";
     state.last_data_received_ts = Date.now();
     state.book.last_data_received_ts = state.last_data_received_ts;
-    state.book.last_update_ts = tickerData?.timestamp ? Number(tickerData.timestamp) * 1000 : state.last_data_received_ts;
+    state.book.last_update_ts = tickerData?.timestamp
+      ? Number(tickerData.timestamp) * 1000 : state.last_data_received_ts;
     state.last_update_ts = state.book.last_update_ts;
     state.sequence = null;
     state.last_error = null;
 
-    if (source === "rest_snapshot" && state.ws_connected) {
-      // WS remains primary when healthy; REST just seeds/reconciles the book.
-    }
     refreshDerived();
     updateFreshness();
-    calculateScore();
   } catch (e) {
     state.last_error = e?.message || String(e);
     updateFreshness();
+    refreshDerived();
   }
 }
 
@@ -278,10 +292,19 @@ function applyWsBook(payload) {
   const asks = payload?.asks;
   if (!Array.isArray(bids) && !Array.isArray(asks)) return false;
 
-  // Apply to a copy first. A malformed/crossed WS delta must never corrupt the live book.
-  const candidate = { bids: new Map(rawBook.bids), asks: new Map(rawBook.asks) };
+  // A WS delta is meaningful only after a REST snapshot has seeded the book.
+  if (rawBook.bids.size === 0 || rawBook.asks.size === 0) {
+    state.last_error = "WS orderbook delta received before valid REST snapshot; waiting for snapshot";
+    return false;
+  }
+
+  const candidate = {
+    bids: new Map(rawBook.bids),
+    asks: new Map(rawBook.asks)
+  };
   applyDelta(candidate.bids, bids || []);
   applyDelta(candidate.asks, asks || []);
+
   const m = bookMetrics(candidate);
   if (!m.validSpread) {
     state.last_error = `WS book rejected: bid=${m.bestBid} ask=${m.bestAsk}`;
@@ -289,36 +312,49 @@ function applyWsBook(payload) {
   }
 
   rawBook = candidate;
-  state.ws_messages_count = (state.ws_messages_count || 0) + 1;
-  state.ws_orderbook_messages_count = (state.ws_orderbook_messages_count || 0) + 1;
+  state.ws_messages_count += 1;
+  state.ws_orderbook_messages_count += 1;
+  state.ws_connected = true;
   state.source = "coincheck_ws";
   state.last_data_received_ts = Date.now();
   state.last_ws_data_received_ts = state.last_data_received_ts;
-  state.last_ws_orderbook_ts = payload?.last_update_at ? Number(payload.last_update_at) * 1000 : state.last_data_received_ts;
+  state.last_ws_orderbook_ts = payload?.last_update_at
+    ? Number(payload.last_update_at) * 1000 : state.last_data_received_ts;
   state.book.last_data_received_ts = state.last_data_received_ts;
   state.book.last_update_ts = state.last_ws_orderbook_ts;
   state.ws_stale = false;
   state.last_error = null;
+
   refreshDerived();
   updateFreshness();
-  calculateScore();
   return true;
 }
 
 function updateFreshness() {
   const now = Date.now();
-  const age = state.last_data_received_ts ? (now - state.last_data_received_ts) / 1000 : null;
-  const wsAge = state.last_ws_data_received_ts ? (now - state.last_ws_data_received_ts) / 1000 : null;
+  const age = state.last_data_received_ts
+    ? (now - state.last_data_received_ts) / 1000 : null;
+  const wsAge = state.last_ws_data_received_ts
+    ? (now - state.last_ws_data_received_ts) / 1000 : null;
 
-  if (state.ws_connected && wsAge != null && wsAge <= WS_STALE_MS / 1000) state.freshness = "LIVE";
-  else if (age != null && age <= 10) state.freshness = "CAUTION";
-  else if (age != null && age <= 30) state.freshness = "STALE";
-  else if (age != null) state.freshness = "INVALID";
-  else state.freshness = "UNKNOWN";
+  if (state.ws_connected && wsAge != null && wsAge <= WS_STALE_MS / 1000) {
+    state.freshness = "LIVE";
+  } else if (age != null && age <= 10) {
+    state.freshness = "CAUTION";
+  } else if (age != null && age <= 30) {
+    state.freshness = "STALE";
+  } else if (age != null) {
+    state.freshness = "INVALID";
+  } else {
+    state.freshness = "UNKNOWN";
+  }
 
-  state.ws_stale = state.ws_connected && (wsAge == null || wsAge > WS_STALE_MS / 1000);
+  state.ws_stale = state.ws_connected &&
+    (wsAge == null || wsAge > WS_STALE_MS / 1000);
+
   if (state.book.last_data_received_ts) {
-    state.book.snapshot_age_sec = Math.max(0, (now - state.book.last_data_received_ts) / 1000);
+    state.book.snapshot_age_sec =
+      Math.max(0, (now - state.book.last_data_received_ts) / 1000);
   }
 }
 
@@ -328,7 +364,8 @@ function publicState() {
   return {
     ...state,
     snapshot_age_sec: state.book.snapshot_age_sec,
-    ws_age_sec: state.last_ws_data_received_ts ? Math.max(0, (Date.now() - state.last_ws_data_received_ts) / 1000) : null,
+    ws_age_sec: state.last_ws_data_received_ts
+      ? Math.max(0, (Date.now() - state.last_ws_data_received_ts) / 1000) : null,
     bid_levels: state.book.bid_levels,
     ask_levels: state.book.ask_levels,
     total_levels: state.book.bid_levels + state.book.ask_levels,
@@ -336,8 +373,8 @@ function publicState() {
     best_ask: state.book.best_ask,
     mid: state.book.mid,
     spread_pct: state.book.spread_pct,
-    ws_messages: state.ws_messages_count || 0,
-    ws_orderbook_messages: state.ws_orderbook_messages_count || 0,
+    ws_messages: state.ws_messages_count,
+    ws_orderbook_messages: state.ws_orderbook_messages_count,
     ws_trade_messages: 0,
     server_time: new Date().toISOString()
   };
@@ -346,23 +383,27 @@ function publicState() {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-app.get("/api/state", (_req, res) => res.status(200).json(publicState()));
-app.get("/api/health", (_req, res) => {
+app.get("/api/state", (_req,res) => res.status(200).json(publicState()));
+
+app.get("/api/health", (_req,res) => {
   const s = publicState();
   res.status(200).json({
     status: "ok",
     service: "shib-monitor-api",
     version: state.version,
-    pair: "shib_jpy",
+    build: state.build,
+    pair: PAIR,
     book_ready: state.book.ready,
-    fresh: state.freshness === "LIVE",
+    fresh: state.freshness === "LIVE" || state.freshness === "CAUTION",
     freshness: state.freshness,
     ws_connected: state.ws_connected,
+    ws_transport_connected: state.ws_transport_connected,
     ws_stale: state.ws_stale,
     ws_age_sec: s.ws_age_sec,
     snapshot_age_sec: s.snapshot_age_sec,
     last_data_received_ts: state.last_data_received_ts,
-    last_data_source: state.source === "coincheck_ws" ? "coincheck_ws" : state.source === "coincheck_rest" ? "rest_snapshot" : null,
+    last_data_source: state.source === "coincheck_ws" ? "coincheck_ws" :
+      state.source === "coincheck_rest" ? "rest_snapshot" : null,
     price: state.price,
     best_bid: state.book.best_bid,
     best_ask: state.book.best_ask,
@@ -372,12 +413,13 @@ app.get("/api/health", (_req, res) => {
     sequence: state.sequence,
     source: state.source,
     last_error: state.last_error,
-    ws_messages: state.ws_messages_count || 0,
-    ws_orderbook_messages: state.ws_orderbook_messages_count || 0,
+    ws_messages: state.ws_messages_count,
+    ws_orderbook_messages: state.ws_orderbook_messages_count,
     ws_trade_messages: 0,
     last_ws_message_ts: state.last_ws_data_received_ts,
     last_ws_orderbook_ts: state.last_ws_orderbook_ts,
     price_in_book: state.book.price_in_book,
+    last_in_ticker_range: state.book.last_in_ticker_range,
     ticker_book_consistent: state.book.ticker_book_consistent,
     integrity_ok: state.book.integrity_ok,
     integrity_reason: state.book.integrity_reason,
@@ -385,13 +427,18 @@ app.get("/api/health", (_req, res) => {
     ticker_last: state.book.ticker_last,
     ticker_bid: state.book.ticker_bid,
     ticker_ask: state.book.ticker_ask,
+    score_usable: state.score_usable,
+    score: state.score,
+    label: state.label,
     server_time: new Date().toISOString()
   });
 });
 
 function broadcast() {
   const msg = JSON.stringify(publicState());
-  for (const c of wss.clients) if (c.readyState === WebSocket.OPEN) c.send(msg);
+  for (const c of wss.clients) {
+    if (c.readyState === WebSocket.OPEN) c.send(msg);
+  }
 }
 
 wss.on("connection", ws => ws.send(JSON.stringify(publicState())));
@@ -405,41 +452,64 @@ function scheduleReconnect() {
 }
 
 function connectCoincheck() {
-  if (coincheckWs && (coincheckWs.readyState === WebSocket.OPEN || coincheckWs.readyState === WebSocket.CONNECTING)) return;
+  if (coincheckWs &&
+      (coincheckWs.readyState === WebSocket.OPEN ||
+       coincheckWs.readyState === WebSocket.CONNECTING)) return;
+
   const ws = new WebSocket(WS_URL);
   coincheckWs = ws;
 
-  ws.on("open", () => {
-    state.ws_connected = true;
+  ws.on("open", async () => {
+    state.ws_transport_connected = true;
+    state.ws_connected = false; // no valid orderbook data yet
     state.ws_stale = false;
     state.last_error = null;
+
+    console.log(`Coincheck WS transport connected; subscribing ${PAIR}-orderbook`);
     ws.send(JSON.stringify({ type: "subscribe", channel: `${PAIR}-orderbook` }));
-    loadRest("rest_snapshot").then(broadcast);
+
+    // Seed/reconcile the orderbook before accepting WS deltas.
+    await loadRest("rest_snapshot");
     broadcast();
   });
 
   ws.on("message", raw => {
     try {
-      const msg = JSON.parse(raw.toString());
+      const text = raw.toString();
+      console.log(`WS RAW ${text.slice(0, 500)}`);
+
+      const msg = JSON.parse(text);
+
       if (Array.isArray(msg)) {
-        if (msg.length >= 2 && msg[0] === PAIR && applyWsBook(msg[1])) broadcast();
+        if (msg.length >= 2 && msg[0] === PAIR) {
+          if (applyWsBook(msg[1])) broadcast();
+          else broadcast();
+        } else {
+          console.log(`WS unrecognized array message: ${JSON.stringify(msg).slice(0,500)}`);
+        }
         return;
       }
+
       if (msg?.type === "error") {
         state.last_error = `WS ${msg.message || "error"}`;
         broadcast();
+        return;
       }
+
+      console.log(`WS unrecognized object message: ${JSON.stringify(msg).slice(0,500)}`);
     } catch (e) {
       state.last_error = `WS parse error: ${e?.message || e}`;
       broadcast();
     }
   });
 
-  ws.on("close", () => {
+  ws.on("close", (code, reason) => {
     if (coincheckWs === ws) coincheckWs = null;
+    state.ws_transport_connected = false;
     state.ws_connected = false;
     state.ws_stale = false;
     state.reconnect_count += 1;
+    state.last_error = `WS closed code=${code}${reason ? ` reason=${reason}` : ""}`;
     updateFreshness();
     broadcast();
     scheduleReconnect();
@@ -453,11 +523,13 @@ function connectCoincheck() {
 
 setInterval(() => {
   updateFreshness();
-  if (state.ws_connected && state.last_ws_data_received_ts) {
+
+  if (state.ws_transport_connected && state.ws_connected &&
+      state.last_ws_data_received_ts) {
     const age = Date.now() - state.last_ws_data_received_ts;
     if (age > WS_STALE_MS) {
       state.ws_stale = true;
-      state.last_error = `orderbook stale ${Math.round(age / 1000)}s; reconnecting`;
+      state.last_error = `orderbook stale ${Math.round(age/1000)}s; reconnecting`;
       broadcast();
       if (coincheckWs?.readyState === WebSocket.OPEN) coincheckWs.terminate();
     }
@@ -471,5 +543,5 @@ loadRest("rest_startup").then(broadcast);
 connectCoincheck();
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`SHIB Monitor v5.4 integrity server listening on ${PORT}`);
+  console.log(`SHIB Monitor v5.4 2nd integrity final listening on ${PORT}`);
 });
