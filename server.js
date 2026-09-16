@@ -55,7 +55,13 @@ let state = {
     last_update_ts: null,
     snapshot_age_sec: null,
     price_in_book: null,
-    ticker_book_consistent: null
+    ticker_book_consistent: null,
+    integrity_ok: false,
+    integrity_reason: "データ未取得",
+    depth_sufficient: false,
+    ticker_last: null,
+    ticker_bid: null,
+    ticker_ask: null
   },
   trade_flow: {
     buy_pct: null,
@@ -66,7 +72,9 @@ let state = {
   score_usable: false,
   score: null,
   label: "判定停止",
-  score_components: {}
+  score_components: {},
+  ws_messages_count: 0,
+  ws_orderbook_messages_count: 0
 };
 
 let rawBook = { bids: new Map(), asks: new Map() };
@@ -150,16 +158,21 @@ function updateConsistency() {
   const b = state.book;
   const price = state.price;
   const hasBook = b.best_bid != null && b.best_ask != null && b.best_bid < b.best_ask;
-  const hasPrice = price != null;
-  b.price_in_book = hasBook && hasPrice ? price >= b.best_bid && price <= b.best_ask : null;
+  b.price_in_book = hasBook && price != null ? price >= b.best_bid && price <= b.best_ask : null;
 
-  if (lastTicker && finiteNumber(lastTicker.bid) != null && finiteNumber(lastTicker.ask) != null && hasBook) {
-    const tb = finiteNumber(lastTicker.bid);
-    const ta = finiteNumber(lastTicker.ask);
-    b.ticker_book_consistent = tb <= ta && tb > 0 && ta > 0;
-  } else {
-    b.ticker_book_consistent = null;
-  }
+  const tb = finiteNumber(lastTicker?.bid);
+  const ta = finiteNumber(lastTicker?.ask);
+  const tl = finiteNumber(lastTicker?.last);
+  b.ticker_last = tl; b.ticker_bid = tb; b.ticker_ask = ta;
+  b.ticker_book_consistent = hasBook && tb != null && ta != null ? tb > 0 && ta > 0 && tb <= ta : null;
+  b.depth_sufficient = b.bid_levels >= 2 && b.ask_levels >= 2;
+  b.integrity_ok = hasBook && b.price_in_book === true && b.ticker_book_consistent === true && b.depth_sufficient;
+
+  if (!hasBook) b.integrity_reason = "BID/ASK不整合または片側欠落";
+  else if (b.price_in_book !== true) b.integrity_reason = `現在価格 ${price ?? "--"} がBID/ASK範囲外`;
+  else if (b.ticker_book_consistent !== true) b.integrity_reason = "Ticker BID/ASK不整合";
+  else if (!b.depth_sufficient) b.integrity_reason = `板の段数不足 (${b.bid_levels}/${b.ask_levels})`;
+  else b.integrity_reason = "OK";
 }
 
 function calculateScore() {
@@ -168,7 +181,7 @@ function calculateScore() {
   const enoughBook = b.ready && b.bid_levels > 0 && b.ask_levels > 0;
   const priceOK = b.price_in_book === true;
 
-  if (!fresh || !enoughBook || !priceOK || b.imbalance_pct == null) {
+  if (!fresh || !enoughBook || !priceOK || !b.integrity_ok || b.imbalance_pct == null) {
     state.score_usable = false;
     state.score = null;
     state.label = "判定停止";
@@ -230,10 +243,16 @@ async function loadRest(source = "rest_poll") {
       throw new Error(`REST book integrity error: bid=${testBid} ask=${testAsk}`);
     }
 
+    const tickerLast = finiteNumber(tickerData?.last);
+    const tickerBid = finiteNumber(tickerData?.bid);
+    const tickerAsk = finiteNumber(tickerData?.ask);
+    if (tickerLast == null || tickerBid == null || tickerAsk == null || tickerBid <= 0 || tickerAsk <= 0 || tickerBid > tickerAsk) {
+      throw new Error("REST ticker integrity error");
+    }
+
     rawBook = next;
     lastTicker = tickerData || null;
-    const last = finiteNumber(tickerData?.last);
-    state.price = last;
+    state.price = tickerLast;
     state.source = "coincheck_rest";
     state.last_data_received_ts = Date.now();
     state.book.last_data_received_ts = state.last_data_received_ts;
@@ -259,14 +278,19 @@ function applyWsBook(payload) {
   const asks = payload?.asks;
   if (!Array.isArray(bids) && !Array.isArray(asks)) return false;
 
-  // Coincheck documents these as order-book differences, so merge them into
-  // the current book instead of replacing the whole book on every message.
-  applyDelta(rawBook.bids, bids || []);
-  applyDelta(rawBook.asks, asks || []);
+  // Apply to a copy first. A malformed/crossed WS delta must never corrupt the live book.
+  const candidate = { bids: new Map(rawBook.bids), asks: new Map(rawBook.asks) };
+  applyDelta(candidate.bids, bids || []);
+  applyDelta(candidate.asks, asks || []);
+  const m = bookMetrics(candidate);
+  if (!m.validSpread) {
+    state.last_error = `WS book rejected: bid=${m.bestBid} ask=${m.bestAsk}`;
+    return false;
+  }
 
-  const d = computeBook();
-  if (!d.validSpread) return false;
-
+  rawBook = candidate;
+  state.ws_messages_count = (state.ws_messages_count || 0) + 1;
+  state.ws_orderbook_messages_count = (state.ws_orderbook_messages_count || 0) + 1;
   state.source = "coincheck_ws";
   state.last_data_received_ts = Date.now();
   state.last_ws_data_received_ts = state.last_data_received_ts;
@@ -312,8 +336,8 @@ function publicState() {
     best_ask: state.book.best_ask,
     mid: state.book.mid,
     spread_pct: state.book.spread_pct,
-    ws_messages: state.ws_connected ? 1 : 0,
-    ws_orderbook_messages: state.last_ws_orderbook_ts ? 1 : 0,
+    ws_messages: state.ws_messages_count || 0,
+    ws_orderbook_messages: state.ws_orderbook_messages_count || 0,
     ws_trade_messages: 0,
     server_time: new Date().toISOString()
   };
@@ -348,12 +372,19 @@ app.get("/api/health", (_req, res) => {
     sequence: state.sequence,
     source: state.source,
     last_error: state.last_error,
-    ws_messages: state.last_ws_data_received_ts ? 1 : 0,
-    ws_orderbook_messages: state.last_ws_orderbook_ts ? 1 : 0,
+    ws_messages: state.ws_messages_count || 0,
+    ws_orderbook_messages: state.ws_orderbook_messages_count || 0,
     ws_trade_messages: 0,
     last_ws_message_ts: state.last_ws_data_received_ts,
     last_ws_orderbook_ts: state.last_ws_orderbook_ts,
     price_in_book: state.book.price_in_book,
+    ticker_book_consistent: state.book.ticker_book_consistent,
+    integrity_ok: state.book.integrity_ok,
+    integrity_reason: state.book.integrity_reason,
+    depth_sufficient: state.book.depth_sufficient,
+    ticker_last: state.book.ticker_last,
+    ticker_bid: state.book.ticker_bid,
+    ticker_ask: state.book.ticker_ask,
     server_time: new Date().toISOString()
   });
 });
@@ -390,8 +421,14 @@ function connectCoincheck() {
   ws.on("message", raw => {
     try {
       const msg = JSON.parse(raw.toString());
-      const payload = Array.isArray(msg) ? msg[1] : msg;
-      if (applyWsBook(payload)) broadcast();
+      if (Array.isArray(msg)) {
+        if (msg.length >= 2 && msg[0] === PAIR && applyWsBook(msg[1])) broadcast();
+        return;
+      }
+      if (msg?.type === "error") {
+        state.last_error = `WS ${msg.message || "error"}`;
+        broadcast();
+      }
     } catch (e) {
       state.last_error = `WS parse error: ${e?.message || e}`;
       broadcast();
