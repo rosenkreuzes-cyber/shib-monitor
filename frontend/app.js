@@ -52,6 +52,9 @@ function render(d) {
   const notes = [];
   if (!b.ready) notes.push('✕ BID/ASKが不整合のため板を無効化');
   if (b.price_in_book === false) notes.push('⚠ 現在価格がBID/ASKの範囲外のため判定停止');
+  if (b.ticker_book_consistent === false) notes.push('⚠ TickerのBID/ASK整合性NG');
+  if (b.depth_sufficient === false) notes.push('⚠ 板の段数不足のため判定停止');
+  if (b.integrity_reason && b.integrity_reason !== 'OK') notes.push('理由：' + b.integrity_reason);
   else if (b.price_in_book === true) notes.push('✓ 現在価格とBID/ASKは整合');
   if (freshness !== 'LIVE') notes.push('⚠ 板鮮度：' + freshness);
   if (!d.ws_connected) notes.push('⚠ WebSocket未接続：RESTで継続取得');
@@ -68,6 +71,9 @@ TOP10 bid ${b.bids_top10?.length || 0} / ask ${b.asks_top10?.length || 0}
 最良買い ${b.best_bid ?? '--'}
 最良売り ${b.best_ask ?? '--'}
 価格整合 ${b.price_in_book == null ? '--' : b.price_in_book ? 'OK' : 'NG'}
+Ticker整合 ${b.ticker_book_consistent == null ? '--' : b.ticker_book_consistent ? 'OK' : 'NG'}
+板深度 ${b.bid_levels || 0}/${b.ask_levels || 0} ${b.depth_sufficient ? 'OK' : '不足'}
+整合性 ${b.integrity_ok ? 'OK' : 'NG'}
 WS ${d.ws_connected ? 'CONNECTED' : 'DISCONNECTED'}
 更新経過 ${d.snapshot_age_sec == null ? '--' : Number(d.snapshot_age_sec).toFixed(1) + '秒'}`;
 
