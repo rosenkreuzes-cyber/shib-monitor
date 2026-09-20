@@ -16,7 +16,7 @@ logging.basicConfig(
 )
 
 PAIR = "shib_jpy"
-VERSION = "5.4-renderfix8"
+VERSION = "5.4-renderfix9"
 
 STALE_SECONDS = 30
 

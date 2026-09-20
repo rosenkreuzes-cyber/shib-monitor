@@ -239,21 +239,40 @@ class CoincheckStream:
 
         before_count = len(self.analyzer.trades)
 
-        try:
-            # Coincheck trades channel may contain multiple trade rows.
-            for trade in payload:
-                if isinstance(trade, list):
-                    self.analyzer.trade(trade)
-        except Exception:
-            LOG.exception("trade payload handling failed")
-            return
+        # Coincheck Public WebSocket trade rows are:
+        # [timestamp, trade_id, pair, rate, amount, side, taker_id, maker_id, itayose_id]
+        for row in payload:
+            if not isinstance(row, list) or len(row) < 6:
+                continue
+
+            trade = {
+                "executed_at": row[0],
+                "id": row[1],
+                "pair": row[2],
+                "rate": row[3],
+                "amount": row[4],
+                "order_type": row[5],
+                "taker_id": row[6] if len(row) > 6 else None,
+                "maker_id": row[7] if len(row) > 7 else None,
+                "itayose_id": row[8] if len(row) > 8 else None,
+            }
+
+            try:
+                self.analyzer.trade(trade)
+            except Exception:
+                LOG.exception("trade row handling failed row=%r", row)
 
         after_count = len(self.analyzer.trades)
 
         if after_count != before_count:
             self.ws_trade_messages += 1
-            # Do NOT change analyzer source to trades. The orderbook source
-            # controls orderbook freshness/decision validity.
+            LOG.info(
+                "trade websocket received #%d pair=%s rows=%d accepted=%d",
+                self.ws_trade_messages,
+                self.pair,
+                len(payload),
+                after_count - before_count,
+            )
             await self.broadcast()
 
     async def _rest_fallback_loop(self):
@@ -303,7 +322,7 @@ class CoincheckStream:
                             max_msg_size=4 * 1024 * 1024,
                         ) as ws:
                             self.transport_connected = True
-                            self.connected = False
+                            self.connected = True
                             self.last_error = None
                             self.last_ws_message_ts = None
                             self.last_ws_orderbook_ts = None

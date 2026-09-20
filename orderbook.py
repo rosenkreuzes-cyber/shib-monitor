@@ -199,7 +199,7 @@ class OrderBookEngine:
         # Every valid WS order-book message refreshes RECEIPT freshness,
         # even when Coincheck omits last_update_at.
         self._mark_received(
-            "ws_diff",
+            "coincheck_ws_orderbook",
             update_ts,
         )
 
