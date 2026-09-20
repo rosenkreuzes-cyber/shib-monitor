@@ -81,7 +81,7 @@ class CoincheckStream:
                 bids = data.get("bids", [])
                 asks = data.get("asks", [])
 
-                self.analyzer.book.load_snapshot(bids, asks)
+                self.analyzer.load_depth({"bids": bids, "asks": asks})
 
                 try:
                     async with session.get(
@@ -94,7 +94,10 @@ class CoincheckStream:
                     if isinstance(ticker, dict):
                         last = ticker.get("last")
                         if last is not None:
-                            self.analyzer.ticker({"last": last})
+                            try:
+                                self.analyzer.ticker({"last": last})
+                            except Exception:
+                                LOG.exception("ticker analyzer update failed")
                 except Exception:
                     LOG.exception("ticker REST request failed")
 
@@ -441,7 +444,6 @@ class CoincheckStream:
                         self.transport_connected = True
                         self.connected = False
                         self.last_error = None
-                        self.analyzer.set_ws(True, None)
                         self.last_ws_message_ts = None
                         self.last_ws_orderbook_ts = None
                         self._debug_raw_messages = 0
@@ -470,8 +472,6 @@ class CoincheckStream:
                             ws,
                             f"{self.pair}-trades",
                         )
-                        self.connected = True
-                        self.analyzer.set_ws(True, None)
 
                         LOG.info(
                             "Coincheck WebSocket subscriptions sent "
