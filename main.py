@@ -16,7 +16,7 @@ logging.basicConfig(
 )
 
 PAIR = "shib_jpy"
-VERSION = "5.4-renderfix6"
+VERSION = "5.4-renderfix7"
 
 STALE_SECONDS = 30
 
@@ -76,16 +76,38 @@ def health_payload():
         "ws_trade_messages": (
             getattr(stream, "ws_trade_messages", 0) if stream else 0
         ),
-        "ws_transport_connected": getattr(stream, "transport_connected", False) if stream else False,
-        "ws_subscribed": getattr(stream, "subscribed", False) if stream else False,
-        "ws_last_event": getattr(stream, "last_ws_event", None) if stream else None,
-        "ws_raw_preview": getattr(stream, "last_ws_raw_preview", None) if stream else None,
-        "ws_subscribe_sent_ts": getattr(stream, "subscribe_sent_ts", None) if stream else None,
         "last_ws_message_ts": (
             getattr(stream, "last_ws_message_ts", None) if stream else None
         ),
         "last_ws_orderbook_ts": (
             getattr(stream, "last_ws_orderbook_ts", None) if stream else None
+        ),
+        "ws_transport_connected": (
+            getattr(stream, "transport_connected", False) if stream else False
+        ),
+        "ws_subscribed": (
+            getattr(stream, "ws_subscribed", False) if stream else False
+        ),
+        "ws_subscribe_sent_ts": (
+            getattr(stream, "ws_subscribe_sent_ts", None) if stream else None
+        ),
+        "ws_subscribe_ack_ts": (
+            getattr(stream, "ws_subscribe_ack_ts", None) if stream else None
+        ),
+        "ws_subscribe_error_ts": (
+            getattr(stream, "ws_subscribe_error_ts", None) if stream else None
+        ),
+        "ws_last_event": (
+            getattr(stream, "ws_last_event", None) if stream else None
+        ),
+        "ws_last_channel": (
+            getattr(stream, "ws_last_channel", None) if stream else None
+        ),
+        "ws_raw_preview_type": (
+            getattr(stream, "ws_raw_preview_type", None) if stream else None
+        ),
+        "ws_raw_preview": (
+            getattr(stream, "ws_raw_preview", None) if stream else None
         ),
 
         "server_time": datetime.now(timezone.utc).isoformat(),
