@@ -9,7 +9,7 @@ LOG = logging.getLogger(__name__)
 
 REST = "https://coincheck.com"
 WS = "wss://ws-api.coincheck.com"
-VERSION = "5.4-renderfix2"
+VERSION = "5.4-renderfix4"
 
 
 class CoincheckStream:
