@@ -16,7 +16,7 @@ logging.basicConfig(
 )
 
 PAIR = "shib_jpy"
-VERSION = "5.4-renderfix4"
+VERSION = "5.4-renderfix5"
 
 STALE_SECONDS = 30
 REST_FALLBACK_SECONDS = 5
@@ -24,7 +24,6 @@ REST_FALLBACK_SECONDS = 5
 analyzer = MarketAnalyzer()
 clients = set()
 stream = None
-refresh_lock = asyncio.Lock()
 
 
 def health_payload():
@@ -204,19 +203,19 @@ async def api_health():
 @app.get("/api/analysis")
 async def analysis():
     data = analyzer.snapshot()
-    return {**data, "service": "shib-monitor-api", "api_version": VERSION}
+    data["api_version"] = VERSION
+    return data
 
 
-@app.post("/api/refresh")
+@app.api_route("/api/refresh", methods=["GET", "POST"])
 async def refresh():
     if stream is None:
-        return {"ok": False, "error": "stream not initialized", "version": VERSION}
-    async with refresh_lock:
-        before = analyzer.book.data_age_sec()
-        await stream.rest_snapshot()
-        data = analyzer.snapshot()
-    book = data.get("book", {})
-    return {"ok": bool(book.get("ready")), "version": VERSION, "pair": PAIR, "previous_age_seconds": before, "freshness": book.get("freshness"), "snapshot_age_sec": book.get("snapshot_age_sec"), "source": data.get("source"), "price": data.get("price"), "score": data.get("score"), "label": data.get("label"), "score_usable": data.get("score_usable"), "server_time": datetime.now(timezone.utc).isoformat()}
+        return {"ok": False, "error": "stream_not_ready", "api_version": VERSION}
+
+    await stream.rest_snapshot()
+    data = analyzer.snapshot()
+    data["api_version"] = VERSION
+    return {"ok": True, "api_version": VERSION, "data": data}
 
 
 @app.get("/api/orderbook")
@@ -261,6 +260,8 @@ async def orderbook():
         "source": data.get("source"),
         "ws_connected": data.get("ws_connected"),
         "error": data.get("last_error"),
+
+        "api_version": VERSION,
 
         "rules": {
             "stale_seconds": STALE_SECONDS,

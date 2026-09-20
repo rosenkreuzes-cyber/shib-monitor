@@ -9,7 +9,7 @@ LOG = logging.getLogger(__name__)
 
 REST = "https://coincheck.com"
 WS = "wss://ws-api.coincheck.com"
-VERSION = "5.4-renderfix4"
+VERSION = "5.4-renderfix5"
 
 
 class CoincheckStream:
@@ -218,6 +218,8 @@ class CoincheckStream:
             LOG.exception("orderbook diff handling failed")
             return
 
+        self.connected = True
+        self.analyzer.set_ws(True, None)
         self.analyzer.set_source("coincheck_ws_orderbook")
 
         LOG.info(
@@ -473,6 +475,12 @@ class CoincheckStream:
                             f"{self.pair}-trades",
                         )
 
+                        # Transport and subscriptions are both established.
+                        # Keep analyzer/health state explicit even before the
+                        # first orderbook frame arrives.
+                        self.connected = True
+                        self.analyzer.set_ws(True, None)
+
                         LOG.info(
                             "Coincheck WebSocket subscriptions sent "
                             "pair=%s",
@@ -494,6 +502,7 @@ class CoincheckStream:
             finally:
                 self.connected = False
                 self.transport_connected = False
+                self.analyzer.set_ws(False, self.last_error)
 
             LOG.warning(
                 "Coincheck WebSocket session ended; "
