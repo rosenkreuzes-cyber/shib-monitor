@@ -9,7 +9,7 @@ LOG = logging.getLogger(__name__)
 
 REST = "https://coincheck.com"
 WS = "wss://ws-api.coincheck.com"
-VERSION = "5.4-renderfix5"
+VERSION = "5.4-renderfix6"
 
 
 class CoincheckStream:
@@ -35,7 +35,11 @@ class CoincheckStream:
 
         self.connected = False
         self.transport_connected = False
+        self.subscribed = False
         self.last_error = None
+        self.last_ws_event = None
+        self.last_ws_raw_preview = None
+        self.subscribe_sent_ts = None
 
         self.ws_messages = 0
         self.ws_orderbook_messages = 0
@@ -81,7 +85,7 @@ class CoincheckStream:
                 bids = data.get("bids", [])
                 asks = data.get("asks", [])
 
-                self.analyzer.load_depth({"bids": bids, "asks": asks})
+                self.analyzer.book.load_snapshot(bids, asks)
 
                 try:
                     async with session.get(
@@ -95,9 +99,9 @@ class CoincheckStream:
                         last = ticker.get("last")
                         if last is not None:
                             try:
-                                self.analyzer.ticker({"last": last})
+                                self.analyzer.last_price = float(last)
                             except Exception:
-                                LOG.exception("ticker analyzer update failed")
+                                pass
                 except Exception:
                     LOG.exception("ticker REST request failed")
 
@@ -124,6 +128,8 @@ class CoincheckStream:
             separators=(",", ":"),
         )
         await ws.send_str(message)
+        if channel.endswith("-orderbook"):
+            self.subscribe_sent_ts = self._now()
         LOG.info("Coincheck subscribe sent: %s", channel)
 
     def _log_raw(self, msg):
@@ -137,11 +143,15 @@ class CoincheckStream:
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", "replace")
 
+        preview = str(raw)
+        if len(preview) > 500:
+            preview = preview[:500] + "...[truncated]"
+        self.last_ws_raw_preview = preview
         LOG.warning(
             "WS RAW #%d type=%s data=%s",
             self._debug_raw_messages,
             msg.type,
-            raw,
+            preview,
         )
 
     async def _handle_text(self, raw_text):
@@ -177,6 +187,9 @@ class CoincheckStream:
                 "recognized orderbook channel=%s",
                 data[0],
             )
+            self.connected = True
+            self.subscribed = True
+            self.last_ws_event = "orderbook"
             await self._handle_orderbook(data[1])
             return
 
@@ -187,11 +200,16 @@ class CoincheckStream:
             and len(data) == 2
             and data[0] == f"{self.pair}-trades"
         ):
+            self.connected = True
+            self.subscribed = True
+            self.last_ws_event = "trade"
             await self._handle_trade(data[1])
             return
 
-        # Subscription acknowledgements, errors and any unexpected frames
-        # remain visible in Render logs.
+        # ACK/error frames are diagnostic only; they do not prove market-data
+        # reception.
+        if isinstance(data, dict) and data.get("type") in ("subscribe", "subscribed", "ack", "error"):
+            self.last_ws_event = str(data.get("type"))
         LOG.warning("WS unrecognized message: %r", data)
 
     async def _handle_orderbook(self, payload):
@@ -218,8 +236,6 @@ class CoincheckStream:
             LOG.exception("orderbook diff handling failed")
             return
 
-        self.connected = True
-        self.analyzer.set_ws(True, None)
         self.analyzer.set_source("coincheck_ws_orderbook")
 
         LOG.info(
@@ -350,6 +366,7 @@ class CoincheckStream:
             ):
                 self.ws_messages += 1
                 self.last_ws_message_ts = self._now()
+                self.last_ws_event = "application_frame"
 
             self._log_raw(msg)
 
@@ -445,9 +462,13 @@ class CoincheckStream:
                     ) as ws:
                         self.transport_connected = True
                         self.connected = False
+                        self.subscribed = False
                         self.last_error = None
                         self.last_ws_message_ts = None
                         self.last_ws_orderbook_ts = None
+                        self.last_ws_event = "transport_connected"
+                        self.last_ws_raw_preview = None
+                        self.subscribe_sent_ts = None
                         self._debug_raw_messages = 0
 
                         LOG.info(
@@ -475,12 +496,6 @@ class CoincheckStream:
                             f"{self.pair}-trades",
                         )
 
-                        # Transport and subscriptions are both established.
-                        # Keep analyzer/health state explicit even before the
-                        # first orderbook frame arrives.
-                        self.connected = True
-                        self.analyzer.set_ws(True, None)
-
                         LOG.info(
                             "Coincheck WebSocket subscriptions sent "
                             "pair=%s",
@@ -501,8 +516,8 @@ class CoincheckStream:
 
             finally:
                 self.connected = False
+                self.subscribed = False
                 self.transport_connected = False
-                self.analyzer.set_ws(False, self.last_error)
 
             LOG.warning(
                 "Coincheck WebSocket session ended; "

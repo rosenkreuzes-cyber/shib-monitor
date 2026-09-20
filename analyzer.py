@@ -4,7 +4,7 @@ from time import time
 from orderbook import OrderBookEngine
 
 
-VERSION = "v5.4-renderfix5"
+VERSION = "v5.4"
 
 
 class MarketAnalyzer:
