@@ -9,7 +9,7 @@ LOG = logging.getLogger(__name__)
 
 REST = "https://coincheck.com"
 WS = "wss://ws-api.coincheck.com"
-VERSION = "5.4-renderfix7"
+VERSION = "5.4-renderfix8"
 
 
 class CoincheckStream:
@@ -39,6 +39,13 @@ class CoincheckStream:
         self.ws_raw_preview = None
         self.ws_raw_preview_type = None
         self.ws_last_channel = None
+        self.ws_close_code = None
+        self.ws_close_reason = None
+        self.ws_exception_type = None
+        self.ws_exception_message = None
+        self.ws_receive_timeout_count = 0
+        self.ws_ping_count = 0
+        self.ws_pong_count = 0
 
         self.ws_messages = 0
         self.ws_orderbook_messages = 0
@@ -309,6 +316,13 @@ class CoincheckStream:
                             self.ws_raw_preview = None
                             self.ws_raw_preview_type = None
                             self.ws_last_channel = None
+                            self.ws_close_code = None
+                            self.ws_close_reason = None
+                            self.ws_exception_type = None
+                            self.ws_exception_message = None
+                            self.ws_receive_timeout_count = 0
+                            self.ws_ping_count = 0
+                            self.ws_pong_count = 0
 
                             LOG.info("Coincheck WebSocket transport connected pair=%s", self.pair)
 
@@ -343,7 +357,29 @@ class CoincheckStream:
                             )
 
                             try:
-                                async for msg in ws:
+                                # Explicit receive timeout is intentional in Fix8:
+                                # it distinguishes "socket is open but absolutely no
+                                # frame arrives" from a normal async-for wait.
+                                while True:
+                                    try:
+                                        msg = await ws.receive(timeout=45)
+                                    except asyncio.TimeoutError:
+                                        self.ws_receive_timeout_count += 1
+                                        self.ws_last_event = "receive_timeout_45s"
+                                        LOG.warning(
+                                            "Coincheck WS receive timeout "
+                                            "count=%d transport_connected=%s "
+                                            "subscribed=%s messages=%d",
+                                            self.ws_receive_timeout_count,
+                                            self.transport_connected,
+                                            self.ws_subscribed,
+                                            self.ws_messages,
+                                        )
+                                        # Do not silently reconnect here yet; leave the
+                                        # connection alive so the next health check can
+                                        # show whether frames eventually arrive.
+                                        continue
+
                                     self.ws_messages += 1
                                     self.last_ws_message_ts = self._now()
                                     self._set_raw_preview(msg)
@@ -432,7 +468,28 @@ class CoincheckStream:
                                             data,
                                         )
 
+                                    elif msg.type == aiohttp.WSMsgType.PING:
+                                        self.ws_ping_count += 1
+                                        self.ws_last_event = "ping_received"
+                                        try:
+                                            await ws.pong()
+                                        except Exception as exc:
+                                            self.last_error = f"{type(exc).__name__}: {exc!r}"
+                                            LOG.exception("Coincheck WS pong failed")
+
+                                    elif msg.type == aiohttp.WSMsgType.PONG:
+                                        self.ws_pong_count += 1
+                                        self.ws_last_event = "pong_received"
+
                                     elif msg.type == aiohttp.WSMsgType.ERROR:
+                                        self.ws_exception_type = (
+                                            type(ws.exception()).__name__
+                                            if ws.exception() else None
+                                        )
+                                        self.ws_exception_message = (
+                                            str(ws.exception())
+                                            if ws.exception() else None
+                                        )
                                         self.last_error = repr(ws.exception())
                                         LOG.error(
                                             "Coincheck WebSocket ERROR "
@@ -449,11 +506,23 @@ class CoincheckStream:
                                         aiohttp.WSMsgType.CLOSE,
                                         aiohttp.WSMsgType.CLOSING,
                                     ):
+                                        self.ws_close_code = ws.close_code
+                                        self.ws_close_reason = getattr(ws, "close_reason", None)
+                                        self.ws_exception_type = (
+                                            type(ws.exception()).__name__
+                                            if ws.exception() else None
+                                        )
+                                        self.ws_exception_message = (
+                                            str(ws.exception())
+                                            if ws.exception() else None
+                                        )
+                                        self.ws_last_event = "socket_closed"
                                         LOG.warning(
                                             "Coincheck WebSocket CLOSED "
-                                            "type=%s close_code=%r exception=%r",
+                                            "type=%s close_code=%r close_reason=%r exception=%r",
                                             msg.type,
                                             ws.close_code,
+                                            getattr(ws, "close_reason", None),
                                             ws.exception(),
                                         )
                                         break
@@ -485,12 +554,18 @@ class CoincheckStream:
                     # cleanly (which does not raise an exception in aiohttp).
                     try:
                         if "ws" in locals():
+                            self.ws_close_code = ws.close_code
+                            self.ws_close_reason = getattr(ws, "close_reason", None)
+                            if ws.exception():
+                                self.ws_exception_type = type(ws.exception()).__name__
+                                self.ws_exception_message = str(ws.exception())
                             LOG.warning(
                                 "Coincheck WebSocket session ended "
-                                "closed=%s close_code=%s exception=%r "
+                                "closed=%s close_code=%s close_reason=%r exception=%r "
                                 "last_error=%r",
                                 ws.closed,
                                 ws.close_code,
+                                getattr(ws, "close_reason", None),
                                 ws.exception(),
                                 self.last_error,
                             )

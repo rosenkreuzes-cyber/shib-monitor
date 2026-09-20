@@ -16,7 +16,7 @@ logging.basicConfig(
 )
 
 PAIR = "shib_jpy"
-VERSION = "5.4-renderfix7"
+VERSION = "5.4-renderfix8"
 
 STALE_SECONDS = 30
 
@@ -108,6 +108,27 @@ def health_payload():
         ),
         "ws_raw_preview": (
             getattr(stream, "ws_raw_preview", None) if stream else None
+        ),
+        "ws_close_code": (
+            getattr(stream, "ws_close_code", None) if stream else None
+        ),
+        "ws_close_reason": (
+            getattr(stream, "ws_close_reason", None) if stream else None
+        ),
+        "ws_exception_type": (
+            getattr(stream, "ws_exception_type", None) if stream else None
+        ),
+        "ws_exception_message": (
+            getattr(stream, "ws_exception_message", None) if stream else None
+        ),
+        "ws_receive_timeout_count": (
+            getattr(stream, "ws_receive_timeout_count", 0) if stream else 0
+        ),
+        "ws_ping_count": (
+            getattr(stream, "ws_ping_count", 0) if stream else 0
+        ),
+        "ws_pong_count": (
+            getattr(stream, "ws_pong_count", 0) if stream else 0
         ),
 
         "server_time": datetime.now(timezone.utc).isoformat(),
