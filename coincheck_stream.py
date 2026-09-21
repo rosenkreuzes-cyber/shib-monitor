@@ -9,7 +9,7 @@ LOG = logging.getLogger(__name__)
 
 REST = "https://coincheck.com"
 WS = "wss://ws-api.coincheck.com"
-VERSION = "5.4-renderfix8"
+VERSION = "5.4-renderfix10"
 
 
 class CoincheckStream:
@@ -46,6 +46,8 @@ class CoincheckStream:
         self.ws_receive_timeout_count = 0
         self.ws_ping_count = 0
         self.ws_pong_count = 0
+        self.ws_data_stale_seconds = 30
+        self.ws_reconnect_seconds = 60
 
         self.ws_messages = 0
         self.ws_orderbook_messages = 0
@@ -213,6 +215,9 @@ class CoincheckStream:
             LOG.exception("orderbook diff handling failed")
             return
 
+        self.connected = True
+        self.transport_connected = True
+        self.analyzer.set_ws(True, None)
         self.analyzer.set_source("coincheck_ws_orderbook")
 
         LOG.info(
@@ -286,7 +291,10 @@ class CoincheckStream:
                     if self.last_ws_orderbook_ts is not None
                     else None
                 )
-                if (not self.connected) or ws_age is None or ws_age > 8:
+                if (not self.transport_connected) or ws_age is None or ws_age > self.ws_data_stale_seconds:
+                    if ws_age is not None and ws_age > self.ws_data_stale_seconds:
+                        self.connected = False
+                        self.analyzer.set_ws(False, "WS orderbook data stale")
                     LOG.warning(
                         "REST fallback refresh pair=%s connected=%s ws_orderbook_age=%s",
                         self.pair, self.connected, ws_age,
@@ -323,6 +331,7 @@ class CoincheckStream:
                         ) as ws:
                             self.transport_connected = True
                             self.connected = True
+                            self.analyzer.set_ws(True, None)
                             self.last_error = None
                             self.last_ws_message_ts = None
                             self.last_ws_orderbook_ts = None
@@ -401,6 +410,9 @@ class CoincheckStream:
 
                                     self.ws_messages += 1
                                     self.last_ws_message_ts = self._now()
+                                    self.connected = True
+                                    self.transport_connected = True
+                                    self.analyzer.set_ws(True, None)
                                     self._set_raw_preview(msg)
 
                                     # Diagnostic: expose the first frames exactly as
@@ -568,6 +580,7 @@ class CoincheckStream:
                 finally:
                     self.connected = False
                     self.transport_connected = False
+                    self.analyzer.set_ws(False, self.last_error)
                     self.ws_last_event = self.ws_last_event or "transport_disconnected"
                     # Keep a useful reason even when the server closes the socket
                     # cleanly (which does not raise an exception in aiohttp).
