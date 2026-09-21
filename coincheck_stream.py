@@ -9,7 +9,7 @@ LOG = logging.getLogger(__name__)
 
 REST = "https://coincheck.com"
 WS = "wss://ws-api.coincheck.com"
-VERSION = "5.4-renderfix10"
+VERSION = "5.4-renderfix11"
 
 
 class CoincheckStream:
@@ -170,28 +170,38 @@ class CoincheckStream:
                 self.ws_last_channel = str(channel)
 
     async def _watchdog(self, ws):
-        # Diagnostic mode: do not force-close a healthy WebSocket merely
-        # because orderbook updates are temporarily sparse. aiohttp heartbeat
-        # handles the connection liveness; the main receive loop handles
-        # actual close/error events.
+        # Transport heartbeat can remain healthy even when the application
+        # channel has stopped delivering orderbook frames.  In that case a
+        # reconnect is required; otherwise the app can sit on a stale socket
+        # forever while REST fallback masks the problem.
         while not ws.closed:
             await asyncio.sleep(15)
+            now = self._now()
+            orderbook_age = (
+                now - self.last_ws_orderbook_ts
+                if self.last_ws_orderbook_ts is not None else None
+            )
             LOG.debug(
                 "watchdog pair=%s ws_age=%s orderbook_age=%s "
                 "ws_messages=%d orderbook_messages=%d trade_messages=%d",
                 self.pair,
-                (
-                    self._now() - self.last_ws_message_ts
-                    if self.last_ws_message_ts is not None else None
-                ),
-                (
-                    self._now() - self.last_ws_orderbook_ts
-                    if self.last_ws_orderbook_ts is not None else None
-                ),
+                (now - self.last_ws_message_ts if self.last_ws_message_ts is not None else None),
+                orderbook_age,
                 self.ws_messages,
                 self.ws_orderbook_messages,
                 self.ws_trade_messages,
             )
+            if orderbook_age is not None and orderbook_age > self.ws_reconnect_seconds:
+                self.connected = False
+                self.analyzer.set_ws(False, "WS orderbook data stale; reconnecting")
+                self.last_error = "WS orderbook data stale; reconnecting"
+                self.ws_last_event = "orderbook_stale_reconnect"
+                LOG.warning(
+                    "Coincheck WS orderbook stale for %.1fs; closing socket for reconnect",
+                    orderbook_age,
+                )
+                await ws.close(code=1000, message=b"orderbook stale")
+                return
 
 
     async def _handle_orderbook(self, payload):
@@ -218,6 +228,7 @@ class CoincheckStream:
         self.connected = True
         self.transport_connected = True
         self.analyzer.set_ws(True, None)
+        self.last_error = None
         self.analyzer.set_source("coincheck_ws_orderbook")
 
         LOG.info(

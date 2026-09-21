@@ -16,7 +16,7 @@ logging.basicConfig(
 )
 
 PAIR = "shib_jpy"
-VERSION = "5.4-renderfix10"
+VERSION = "5.4-renderfix11"
 
 STALE_SECONDS = 30
 
@@ -32,13 +32,17 @@ def health_payload():
     freshness = b.get("freshness")
     ready = bool(b.get("ready"))
     ws_connected = bool(s.get("ws_connected"))
-
-    # LIVE/CAUTION means the local order book has received recent data.
-    fresh = freshness in ("LIVE", "CAUTION")
-    ws_stale = (
-        b.get("snapshot_age_sec") is None
-        or b.get("snapshot_age_sec") > STALE_SECONDS
+    last_ws_orderbook_ts = getattr(stream, "last_ws_orderbook_ts", None) if stream else None
+    now_ts = datetime.now(timezone.utc).timestamp()
+    ws_age_sec = (
+        round(max(0.0, now_ts - float(last_ws_orderbook_ts)), 3)
+        if last_ws_orderbook_ts is not None else None
     )
+
+    # "fresh" describes the local book; "ws_stale" specifically describes
+    # the age of the latest WebSocket orderbook frame.
+    fresh = freshness in ("LIVE", "CAUTION")
+    ws_stale = ws_age_sec is None or ws_age_sec > STALE_SECONDS
 
     return {
         "status": "ok" if ready and fresh else "degraded",
@@ -52,7 +56,7 @@ def health_payload():
         "ws_connected": ws_connected,
         "ws_stale": ws_stale,
 
-        "ws_age_sec": b.get("snapshot_age_sec"),
+        "ws_age_sec": ws_age_sec,
         "snapshot_age_sec": b.get("snapshot_age_sec"),
         "last_data_received_ts": b.get("last_data_received_ts"),
         "last_data_source": b.get("last_data_source"),
