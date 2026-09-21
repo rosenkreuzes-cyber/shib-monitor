@@ -9,7 +9,7 @@ LOG = logging.getLogger(__name__)
 
 REST = "https://coincheck.com"
 WS = "wss://ws-api.coincheck.com"
-VERSION = "5.4-renderfix11"
+VERSION = "5.4-renderfix12"
 
 
 class CoincheckStream:
@@ -306,6 +306,9 @@ class CoincheckStream:
                     if ws_age is not None and ws_age > self.ws_data_stale_seconds:
                         self.connected = False
                         self.analyzer.set_ws(False, "WS orderbook data stale")
+                    elif ws_age is None:
+                        self.connected = False
+                        self.analyzer.set_ws(False, "WS awaiting orderbook data")
                     LOG.warning(
                         "REST fallback refresh pair=%s connected=%s ws_orderbook_age=%s",
                         self.pair, self.connected, ws_age,
@@ -341,11 +344,13 @@ class CoincheckStream:
                             max_msg_size=4 * 1024 * 1024,
                         ) as ws:
                             self.transport_connected = True
-                            self.connected = True
-                            self.analyzer.set_ws(True, None)
+                            # Transport is open, but logical market-data connection is
+                            # not considered LIVE until a valid orderbook frame arrives.
+                            self.connected = False
+                            self.analyzer.set_ws(False, "WS awaiting orderbook data")
                             self.last_error = None
-                            self.last_ws_message_ts = None
-                            self.last_ws_orderbook_ts = None
+                            # Keep the previous timestamps across reconnects for diagnostics.
+                            # Clearing them made a fresh socket look healthy even before data arrived.
                             self._debug_raw_messages = 0
                             self.ws_subscribed = False
                             self.ws_subscribe_sent_ts = None
