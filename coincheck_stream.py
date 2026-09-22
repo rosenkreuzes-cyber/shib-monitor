@@ -10,6 +10,8 @@ WS_URL="wss://ws-api.coincheck.com/"
 REST_INTERVAL=5.0
 RECONNECT_INITIAL=2.0
 RECONNECT_MAX=30.0
+WS_STALE_SECONDS=30.0
+WS_IDLE_SECONDS=10.0
 
 class CoincheckStream:
     def __init__(self,pair,analyzer,broadcast=None):
@@ -21,6 +23,8 @@ class CoincheckStream:
         self.ws_subscribe_sent_ts=None; self.ws_subscribe_ack_ts=None; self.ws_subscribe_error_ts=None
         self.ws_last_event=None; self.ws_last_channel=None; self.ws_raw_preview_type=None; self.ws_raw_preview=None
         self.ws_close_code=None; self.ws_close_reason=None; self.ws_exception_type=None; self.ws_exception_message=None
+        self.ws_trade_raw_preview=None; self.ws_trade_parse_failures=0; self.ws_nontrade_list_messages=0
+        self.ws_last_data_state="NEVER"
         self.rest_refresh_count=0; self.last_rest_refresh_ts=None; self.rest_fail_count=0
     def now(self): return time()
     async def broadcast(self):
@@ -77,10 +81,26 @@ class CoincheckStream:
             return
         if isinstance(d,list):
             changed=False
+            matched_rows=0
             for row in d:
                 if isinstance(row,list) and len(row)>=6 and row[2]==self.pair:
+                    matched_rows += 1
+                    self.ws_trade_raw_preview=json.dumps(row,ensure_ascii=False)[:1000]
+                    side=row[5]
+                    if side not in ("buy","sell"):
+                        self.ws_trade_parse_failures += 1
+                        self.ws_last_event="trade_parse_error"
+                        continue
+                    try:
+                        float(row[3]); float(row[4]); float(row[0])
+                    except (TypeError,ValueError):
+                        self.ws_trade_parse_failures += 1
+                        self.ws_last_event="trade_parse_error"
+                        continue
                     self.ws_trade_messages+=1; self.last_ws_trade_ts=self.now(); self.ws_last_channel=f"{self.pair}-trades"; self.ws_last_event="trade_received"
                     self.analyzer.trade({"executed_at":row[0],"id":row[1],"pair":row[2],"price":row[3],"amount":row[4],"side":row[5]}); changed=True
+            if matched_rows == 0:
+                self.ws_nontrade_list_messages += 1
             if changed: self.analyzer.set_ws(True,None); self.ws_last_error=None; await self.broadcast()
     async def ws_session(self,session):
         async with session.ws_connect(WS_URL,heartbeat=20,autoping=True,autoclose=True,receive_timeout=None,timeout=15) as ws:
@@ -117,4 +137,20 @@ class CoincheckStream:
                     except asyncio.CancelledError: pass
     def health(self):
         n=self.now(); age=lambda x: round(n-x,3) if x else None
-        return {"ws_transport_connected":self.transport_connected,"ws_connected":self.connected,"ws_subscribed":self.subscribed,"ws_age_sec":age(self.last_ws_message_ts),"ws_orderbook_age_sec":age(self.last_ws_orderbook_ts),"ws_subscribe_sent_ts":self.ws_subscribe_sent_ts,"ws_subscribe_ack_ts":self.ws_subscribe_ack_ts,"ws_subscribe_error_ts":self.ws_subscribe_error_ts,"ws_last_event":self.ws_last_event,"ws_last_channel":self.ws_last_channel,"ws_raw_preview_type":self.ws_raw_preview_type,"ws_raw_preview":self.ws_raw_preview,"ws_close_code":self.ws_close_code,"ws_close_reason":self.ws_close_reason,"ws_exception_type":self.ws_exception_type,"ws_exception_message":self.ws_exception_message,"ws_messages":self.ws_messages,"ws_orderbook_messages":self.ws_orderbook_messages,"ws_trade_messages":self.ws_trade_messages,"last_ws_message_ts":self.last_ws_message_ts,"last_ws_orderbook_ts":self.last_ws_orderbook_ts,"last_ws_trade_ts":self.last_ws_trade_ts,"rest_refresh_count":self.rest_refresh_count,"last_rest_refresh_ts":self.last_rest_refresh_ts,"rest_fail_count":self.rest_fail_count,"rest_last_error":self.last_error,"ws_last_error":self.ws_last_error}
+        msg_age=age(self.last_ws_message_ts)
+        ob_age=age(self.last_ws_orderbook_ts)
+        trade_age=age(self.last_ws_trade_ts)
+        if not self.connected:
+            data_state="DISCONNECTED"
+        elif ob_age is None and trade_age is None:
+            data_state="CONNECTED_NO_DATA"
+        elif ob_age is not None and ob_age <= WS_IDLE_SECONDS:
+            data_state="LIVE"
+        elif trade_age is not None and trade_age <= WS_IDLE_SECONDS:
+            data_state="LIVE_TRADE"
+        elif ob_age is not None and ob_age <= WS_STALE_SECONDS:
+            data_state="IDLE"
+        else:
+            data_state="STALE"
+        self.ws_last_data_state=data_state
+        return {"ws_transport_connected":self.transport_connected,"ws_connected":self.connected,"ws_subscribed":self.subscribed,"ws_age_sec":msg_age,"ws_orderbook_age_sec":ob_age,"ws_trade_age_sec":trade_age,"ws_data_state":data_state,"ws_subscribe_sent_ts":self.ws_subscribe_sent_ts,"ws_subscribe_ack_ts":self.ws_subscribe_ack_ts,"ws_subscribe_error_ts":self.ws_subscribe_error_ts,"ws_last_event":self.ws_last_event,"ws_last_channel":self.ws_last_channel,"ws_raw_preview_type":self.ws_raw_preview_type,"ws_raw_preview":self.ws_raw_preview,"ws_close_code":self.ws_close_code,"ws_close_reason":self.ws_close_reason,"ws_exception_type":self.ws_exception_type,"ws_exception_message":self.ws_exception_message,"ws_messages":self.ws_messages,"ws_orderbook_messages":self.ws_orderbook_messages,"ws_trade_messages":self.ws_trade_messages,"ws_trade_parse_failures":self.ws_trade_parse_failures,"ws_nontrade_list_messages":self.ws_nontrade_list_messages,"ws_trade_raw_preview":self.ws_trade_raw_preview,"last_ws_message_ts":self.last_ws_message_ts,"last_ws_orderbook_ts":self.last_ws_orderbook_ts,"last_ws_trade_ts":self.last_ws_trade_ts,"rest_refresh_count":self.rest_refresh_count,"last_rest_refresh_ts":self.last_rest_refresh_ts,"rest_fail_count":self.rest_fail_count,"rest_last_error":self.last_error,"ws_last_error":self.ws_last_error}

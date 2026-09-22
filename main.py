@@ -15,7 +15,7 @@ logging.basicConfig(
 )
 
 PAIR = "shib_jpy"
-VERSION = "5.4-renderfix16"
+VERSION = "5.4-renderfix17"
 
 STALE_SECONDS = 30
 
@@ -27,7 +27,8 @@ stream = None
 def health_payload():
     s=analyzer.snapshot(); b=s.get("book",{}); wh=stream.health() if stream else {}
     freshness=b.get("freshness"); ready=bool(b.get("ready")); fresh=freshness in ("LIVE","CAUTION")
-    return {"status":"ok" if ready and fresh else "degraded","service":"shib-monitor-api","version":VERSION,"pair":PAIR,"book_ready":ready,"fresh":fresh,"freshness":freshness,"ws_connected":bool(wh.get("ws_connected")),"ws_stale":wh.get("ws_orderbook_age_sec") is None or wh.get("ws_orderbook_age_sec")>STALE_SECONDS,"snapshot_age_sec":b.get("snapshot_age_sec"),"last_data_received_ts":b.get("last_data_received_ts"),"last_data_source":b.get("last_data_source"),"price":s.get("price"),"best_bid":b.get("best_bid"),"best_ask":b.get("best_ask"),"bid_levels":b.get("bid_levels"),"ask_levels":b.get("ask_levels"),"total_levels":b.get("total_levels"),"sequence":b.get("sequence"),"source":s.get("source"),"last_error":s.get("last_error"),"ws_last_error":s.get("ws_last_error"),**wh,"server_time":datetime.now(timezone.utc).isoformat()}
+    return {"status":"ok" if ready and fresh else "degraded","service":"shib-monitor-api","version":VERSION,"pair":PAIR,"book_ready":ready,"fresh":fresh,"freshness":freshness,"ws_connected":bool(wh.get("ws_connected")),"ws_stale":wh.get("ws_data_state") in ("STALE", "DISCONNECTED"),
+        "ws_data_state":wh.get("ws_data_state"),"snapshot_age_sec":b.get("snapshot_age_sec"),"last_data_received_ts":b.get("last_data_received_ts"),"last_data_source":b.get("last_data_source"),"price":s.get("price"),"best_bid":b.get("best_bid"),"best_ask":b.get("best_ask"),"bid_levels":b.get("bid_levels"),"ask_levels":b.get("ask_levels"),"total_levels":b.get("total_levels"),"sequence":b.get("sequence"),"source":s.get("source"),"last_error":s.get("last_error"),"ws_last_error":s.get("ws_last_error"),**wh,"server_time":datetime.now(timezone.utc).isoformat()}
 
 
 async def broadcast():
