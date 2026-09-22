@@ -1,159 +1,189 @@
 import asyncio
-import os
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 
-from analyzer import MarketAnalyzer, VERSION as ANALYZER_VERSION
-from coincheck_stream import CoincheckStream, VERSION as STREAM_VERSION
+from analyzer import MarketAnalyzer
+from coincheck_stream import CoincheckStream
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
-VERSION = "5.4-renderfix14"
-PAIR = os.getenv("PAIR", "shib_jpy")
+PAIR = "shib_jpy"
+VERSION = "5.4-renderfix16"
+
+STALE_SECONDS = 30
 
 analyzer = MarketAnalyzer()
-stream = CoincheckStream(PAIR, analyzer)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await stream.start()
-    yield
-    await stream.stop()
-
-
-app = FastAPI(title="SHIB/JPY Monitor", version=VERSION, lifespan=lifespan)
+clients = set()
+stream = None
 
 
 def health_payload():
-    book = analyzer.book.snapshot()
-    ws = stream.status()
-    age = book.get("snapshot_age_sec")
+    s=analyzer.snapshot(); b=s.get("book",{}); wh=stream.health() if stream else {}
+    freshness=b.get("freshness"); ready=bool(b.get("ready")); fresh=freshness in ("LIVE","CAUTION")
+    return {"status":"ok" if ready and fresh else "degraded","service":"shib-monitor-api","version":VERSION,"pair":PAIR,"book_ready":ready,"fresh":fresh,"freshness":freshness,"ws_connected":bool(wh.get("ws_connected")),"ws_stale":wh.get("ws_orderbook_age_sec") is None or wh.get("ws_orderbook_age_sec")>STALE_SECONDS,"snapshot_age_sec":b.get("snapshot_age_sec"),"last_data_received_ts":b.get("last_data_received_ts"),"last_data_source":b.get("last_data_source"),"price":s.get("price"),"best_bid":b.get("best_bid"),"best_ask":b.get("best_ask"),"bid_levels":b.get("bid_levels"),"ask_levels":b.get("ask_levels"),"total_levels":b.get("total_levels"),"sequence":b.get("sequence"),"source":s.get("source"),"last_error":s.get("last_error"),"ws_last_error":s.get("ws_last_error"),**wh,"server_time":datetime.now(timezone.utc).isoformat()}
 
-    # Price comes from the latest REST/WS trade; fallback to book midpoint.
-    price = analyzer.last_price
-    if price is None:
-        price = book.get("mid")
 
-    fresh = (
-        book["ready"]
-        and book["freshness"] not in ("INVALID", "UNKNOWN")
+async def broadcast():
+    data = analyzer.snapshot()
+    dead = []
+
+    for ws in list(clients):
+        try:
+            await ws.send_json(data)
+        except Exception:
+            dead.append(ws)
+
+    for ws in dead:
+        clients.discard(ws)
+
+
+async def stream_runner():
+    global stream
+
+    stream = CoincheckStream(
+        PAIR,
+        analyzer,
+        broadcast,
     )
 
-    status = "ok" if fresh else "degraded"
+    await stream.run()
 
-    result = {
-        "status": status,
-        "service": "shib-monitor-api",
-        "version": VERSION,
-        "pair": PAIR,
-        "book_ready": book["ready"],
-        "fresh": fresh,
-        "freshness": book["freshness"],
-        "ws_connected": ws["ws_connected"],
-        "ws_stale": ws["ws_stale"],
-        "ws_age_sec": (
-            round(
-                __import__("time").time() - ws["last_ws_message_ts"], 3
-            )
-            if ws["last_ws_message_ts"] else None
-        ),
-        "snapshot_age_sec": age,
-        "last_data_received_ts": book["last_data_received_ts"],
-        "last_data_source": book["last_data_source"],
-        "price": price,
-        "best_bid": book["best_bid"],
-        "best_ask": book["best_ask"],
-        "bid_levels": book["bid_levels"],
-        "ask_levels": book["ask_levels"],
-        "total_levels": book["total_levels"],
-        "sequence": book["sequence"],
-        "source": analyzer.source,
-        "last_error": ws["last_error"],
-        "score": analyzer.snapshot().get("score"),
-        "label": analyzer.snapshot().get("label"),
-        "score_usable": analyzer.snapshot().get("score_usable"),
-        **ws,
-        "server_time": datetime.now(timezone.utc).isoformat(),
-    }
-    return result
+
+@asynccontextmanager
+async def lifespan(app):
+    task = asyncio.create_task(stream_runner())
+
+    try:
+        yield
+    finally:
+        task.cancel()
+
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(
+    title="SHIB Monitor OrderFlow",
+    version=VERSION,
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/")
 async def root():
-    return HTMLResponse("""
-<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SHIB/JPY Monitor fix14</title>
-<style>
-body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:16px}
-.card{max-width:720px;margin:auto;background:#1c1c1c;border-radius:16px;padding:18px}
-h1{font-size:20px;margin:0 0 14px}
-pre{white-space:pre-wrap;word-break:break-word;background:#080808;padding:14px;border-radius:12px}
-button{padding:10px 14px;border:0;border-radius:10px;cursor:pointer}
-.ok{color:#7cff9b}.bad{color:#ff7777}
-</style>
-</head>
-<body>
-<div class="card">
-<h1>SHIB/JPY Monitor — renderfix14</h1>
-<div id="summary">読み込み中…</div>
-<pre id="data">---</pre>
-<button onclick="load()">更新</button>
-</div>
-<script>
-async function load(){
-  try{
-    const r=await fetch('/api/health',{cache:'no-store'});
-    const d=await r.json();
-    document.getElementById('summary').innerHTML =
-      `<b class="${d.status==='ok'?'ok':'bad'}">${d.status}</b>
-      　${d.price ?? '-'}　板:${d.freshness}
-      　WS:${d.ws_connected?'LIVE':'待機'}`;
-    document.getElementById('data').textContent=JSON.stringify(d,null,2);
-  }catch(e){
-    document.getElementById('summary').textContent='通信エラー: '+e;
-  }
-}
-load();
-setInterval(load,2000);
-</script>
-</body>
-</html>
-""")
+    return {
+        "app": "SHIB Monitor OrderFlow",
+        "version": VERSION,
+        "pair": PAIR,
+        "status": "running",
+        "api": [
+            "/health",
+            "/api/health",
+            "/api/orderbook",
+            "/api/analysis",
+            "/ws",
+        ],
+    }
 
 
 @app.get("/health")
 async def health():
-    return JSONResponse(health_payload())
+    return health_payload()
 
 
 @app.get("/api/health")
 async def api_health():
-    return JSONResponse(health_payload())
+    return health_payload()
 
 
 @app.get("/api/analysis")
-async def api_analysis():
-    return JSONResponse(analyzer.snapshot())
+async def analysis():
+    return analyzer.snapshot()
 
 
 @app.get("/api/orderbook")
-async def api_orderbook():
-    return JSONResponse(analyzer.book.snapshot())
+async def orderbook():
+    data = analyzer.snapshot()
+    book = data.get("book", {})
+
+    freshness = book.get("freshness")
+    ready = bool(book.get("ready"))
+    fresh = freshness in ("LIVE", "CAUTION")
+
+    return {
+        "ok": bool(ready and fresh),
+        "pair": PAIR,
+        "ready": ready,
+        "fresh": fresh,
+        "freshness": freshness,
+        "age_seconds": book.get("snapshot_age_sec"),
+        "server_time": datetime.now(timezone.utc).isoformat(),
+
+        "ticker": {
+            "last": data.get("price"),
+        },
+
+        "book": book,
+
+        "price": data.get("price"),
+        "price_change_pct": data.get("price_change_pct"),
+        "price_change_5m_pct": data.get("price_change_5m_pct"),
+
+        "score": data.get("score"),
+        "label": data.get("label"),
+        "score_usable": data.get("score_usable"),
+
+        "trade_flow": data.get("trade_flow"),
+        "large_trade_flow": data.get("large_trade_flow"),
+
+        "absorption": data.get("absorption"),
+
+        "score_components": data.get("score_components"),
+
+        "source": data.get("source"),
+        "ws_connected": data.get("ws_connected"),
+        "error": data.get("last_error"),
+
+        "rules": {
+            "stale_seconds": STALE_SECONDS,
+            "decision_allowed": bool(ready and fresh),
+        },
+    }
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
+async def websocket(socket: WebSocket):
+    await socket.accept()
+    clients.add(socket)
+
     try:
+        await socket.send_json(analyzer.snapshot())
+
         while True:
-            await websocket.send_json(analyzer.snapshot())
-            await asyncio.sleep(1)
+            await socket.receive_text()
+
+    except WebSocketDisconnect:
+        pass
+
     except Exception:
         pass
+
+    finally:
+        clients.discard(socket)

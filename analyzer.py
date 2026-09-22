@@ -4,7 +4,7 @@ from time import time
 from orderbook import OrderBookEngine
 
 
-VERSION = "v5.4"
+VERSION = "v5.4-renderfix16"
 
 
 class MarketAnalyzer:
@@ -22,6 +22,7 @@ class MarketAnalyzer:
         self.source = "unknown"
         self.ws_connected = False
         self.last_error = None
+        self.ws_last_error = None
 
         self.last_trade_ids = deque(maxlen=5000)
         self.last_trade_id_set = set()
@@ -38,7 +39,7 @@ class MarketAnalyzer:
 
     def set_ws(self, connected, error=None):
         self.ws_connected = connected
-        self.last_error = error
+        self.ws_last_error = error
 
     def load_depth(self, d):
         self.book.load_snapshot(
@@ -400,6 +401,7 @@ class MarketAnalyzer:
             "source": self.source,
             "ws_connected": self.ws_connected,
             "last_error": self.last_error,
+            "ws_last_error": self.ws_last_error,
             "book": book,
             "trade_flow": flow,
             "large_trade_flow": large,
