@@ -43,3 +43,6 @@ Health check:
 - Subscription ACK is diagnostic only; lack of an ACK is not treated as proof of failure.
 - Health output exposes channel-specific connection, activity, error, and reconnect counters.
 - REST health/decision status remains independent of WebSocket status.
+
+
+Fix21 adds channel-specific WebSocket upgrade status/headers, exact subscribe payload diagnostics, subscribe send timing, and staggers trades by 2 seconds after orderbook connection for clearer isolation. REST remains primary.

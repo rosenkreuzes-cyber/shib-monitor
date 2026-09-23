@@ -17,6 +17,7 @@ WS_IDLE_SECONDS = 10.0
 WS_NO_DATA_RECONNECT_SECONDS = 25.0
 WS_CONNECT_GRACE_SECONDS = 8.0
 WS_RECEIVE_PREVIEW_LIMIT = 1000
+WS_TRADE_START_DELAY_SECONDS = 2.0
 
 
 class CoincheckStream:
@@ -47,6 +48,10 @@ class CoincheckStream:
         self.ws_orderbook_transport_connected = False
         self.ws_orderbook_active = False
         self.ws_orderbook_subscribe_sent_ts = None
+        self.ws_orderbook_subscribe_payload = None
+        self.ws_orderbook_subscribe_send_elapsed_ms = None
+        self.ws_orderbook_ws_status = None
+        self.ws_orderbook_ws_response_headers = None
         self.ws_orderbook_subscribe_ack_ts = None
         self.ws_orderbook_subscribe_error_ts = None
         self.ws_orderbook_last_event = None
@@ -69,6 +74,10 @@ class CoincheckStream:
         self.ws_trade_transport_connected = False
         self.ws_trade_active = False
         self.ws_trade_subscribe_sent_ts = None
+        self.ws_trade_subscribe_payload = None
+        self.ws_trade_subscribe_send_elapsed_ms = None
+        self.ws_trade_ws_status = None
+        self.ws_trade_ws_response_headers = None
         self.ws_trade_subscribe_ack_ts = None
         self.ws_trade_subscribe_error_ts = None
         self.ws_trade_last_event = None
@@ -205,18 +214,23 @@ class CoincheckStream:
             await asyncio.sleep(REST_INTERVAL)
 
     async def _subscribe(self, ws, channel, kind):
-        await ws.send_str(
-            json.dumps({"type": "subscribe", "channel": channel})
-        )
+        payload = json.dumps({"type": "subscribe", "channel": channel}, separators=(",", ":"))
+        send_started = self.now()
+        await ws.send_str(payload)
+        send_elapsed_ms = round((self.now() - send_started) * 1000.0, 3)
         ts = self.now()
         self.ws_subscribe_sent_ts = ts
         self.ws_last_event = f"subscribe_sent:{channel}"
         self.ws_last_channel = channel
         if kind == "orderbook":
             self.ws_orderbook_subscribe_sent_ts = ts
+            self.ws_orderbook_subscribe_payload = payload
+            self.ws_orderbook_subscribe_send_elapsed_ms = send_elapsed_ms
             self.ws_orderbook_last_event = "subscribe_sent"
         else:
             self.ws_trade_subscribe_sent_ts = ts
+            self.ws_trade_subscribe_payload = payload
+            self.ws_trade_subscribe_send_elapsed_ms = send_elapsed_ms
             self.ws_trade_last_event = "subscribe_sent"
 
     async def _handle_control(self, data, kind):
@@ -414,6 +428,21 @@ class CoincheckStream:
             timeout=15,
         ) as ws:
             started_ts = self.now()
+            response = getattr(ws, "_response", None)
+            ws_status = getattr(response, "status", None)
+            headers = getattr(response, "headers", None)
+            header_preview = None
+            if headers is not None:
+                try:
+                    header_preview = {str(k): str(v) for k, v in headers.items()}
+                except Exception:
+                    header_preview = repr(headers)[:2000]
+            if kind == "orderbook":
+                self.ws_orderbook_ws_status = ws_status
+                self.ws_orderbook_ws_response_headers = header_preview
+            else:
+                self.ws_trade_ws_status = ws_status
+                self.ws_trade_ws_response_headers = header_preview
             if kind == "orderbook":
                 self.ws_orderbook_connection_started_ts = started_ts
                 self.ws_orderbook_connected = True
@@ -612,10 +641,18 @@ class CoincheckStream:
             sock_read=None,
         )
         async with aiohttp.ClientSession(timeout=timeout) as session:
+            orderbook_task = asyncio.create_task(
+                self.ws_channel_loop(session, "orderbook")
+            )
+
+            async def delayed_trades():
+                await asyncio.sleep(WS_TRADE_START_DELAY_SECONDS)
+                await self.ws_channel_loop(session, "trades")
+
             tasks = [
                 asyncio.create_task(self.rest_loop(session)),
-                asyncio.create_task(self.ws_channel_loop(session, "orderbook")),
-                asyncio.create_task(self.ws_channel_loop(session, "trades")),
+                orderbook_task,
+                asyncio.create_task(delayed_trades()),
             ]
             try:
                 await asyncio.gather(*tasks)
@@ -678,6 +715,14 @@ class CoincheckStream:
             "ws_age_sec": msg_age,
             "ws_orderbook_age_sec": ob_age,
             "ws_trade_age_sec": trade_age,
+            "ws_orderbook_subscribe_payload": self.ws_orderbook_subscribe_payload,
+            "ws_orderbook_subscribe_send_elapsed_ms": self.ws_orderbook_subscribe_send_elapsed_ms,
+            "ws_orderbook_ws_status": self.ws_orderbook_ws_status,
+            "ws_orderbook_ws_response_headers": self.ws_orderbook_ws_response_headers,
+            "ws_trade_subscribe_payload": self.ws_trade_subscribe_payload,
+            "ws_trade_subscribe_send_elapsed_ms": self.ws_trade_subscribe_send_elapsed_ms,
+            "ws_trade_ws_status": self.ws_trade_ws_status,
+            "ws_trade_ws_response_headers": self.ws_trade_ws_response_headers,
             "ws_data_state": data_state,
             "ws_subscribe_sent_ts": self.ws_subscribe_sent_ts,
             "ws_subscribe_ack_ts": self.ws_subscribe_ack_ts,
