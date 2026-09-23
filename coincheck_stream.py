@@ -16,6 +16,7 @@ WS_STALE_SECONDS = 30.0
 WS_IDLE_SECONDS = 10.0
 WS_NO_DATA_RECONNECT_SECONDS = 25.0
 WS_CONNECT_GRACE_SECONDS = 8.0
+WS_RECEIVE_PREVIEW_LIMIT = 1000
 
 
 class CoincheckStream:
@@ -61,6 +62,8 @@ class CoincheckStream:
         self.ws_orderbook_receive_extra_preview = None
         self.ws_orderbook_last_close_type = None
         self.ws_orderbook_last_close_message = None
+        self.ws_orderbook_receive_wait_started_ts = None
+        self.ws_orderbook_receive_wait_seconds = None
 
         self.ws_trade_connected = False
         self.ws_trade_transport_connected = False
@@ -81,6 +84,8 @@ class CoincheckStream:
         self.ws_trade_receive_extra_preview = None
         self.ws_trade_last_close_type = None
         self.ws_trade_last_close_message = None
+        self.ws_trade_receive_wait_started_ts = None
+        self.ws_trade_receive_wait_seconds = None
 
         self.ws_subscribe_sent_ts = None
         self.ws_subscribe_ack_ts = None
@@ -98,6 +103,8 @@ class CoincheckStream:
         self.ws_receive_extra_preview = None
         self.ws_last_close_type = None
         self.ws_last_close_message = None
+        self.ws_receive_wait_started_ts = None
+        self.ws_receive_wait_seconds = None
 
         self.ws_trade_raw_preview = None
         self.ws_trade_parse_failures = 0
@@ -430,10 +437,26 @@ class CoincheckStream:
 
             try:
                 while not self._stopped:
+                    receive_started = self.now()
+                    if kind == "orderbook":
+                        self.ws_orderbook_receive_wait_started_ts = receive_started
+                    else:
+                        self.ws_trade_receive_wait_started_ts = receive_started
+                    self.ws_receive_wait_started_ts = receive_started
+
                     message = await ws.receive()
+                    receive_elapsed = round(self.now() - receive_started, 3)
+                    if kind == "orderbook":
+                        self.ws_orderbook_receive_wait_seconds = receive_elapsed
+                    else:
+                        self.ws_trade_receive_wait_seconds = receive_elapsed
+                    self.ws_receive_wait_seconds = receive_elapsed
+
                     type_name = getattr(message.type, "name", str(message.type))
-                    data_preview = str(getattr(message, "data", ""))[:1000]
-                    extra_preview = str(getattr(message, "extra", ""))[:1000]
+                    data = getattr(message, "data", None)
+                    extra = getattr(message, "extra", None)
+                    data_preview = repr(data)[:WS_RECEIVE_PREVIEW_LIMIT] if data is not None else None
+                    extra_preview = repr(extra)[:WS_RECEIVE_PREVIEW_LIMIT] if extra is not None else None
 
                     if kind == "orderbook":
                         self.ws_orderbook_receive_type = type_name
@@ -460,29 +483,50 @@ class CoincheckStream:
                     elif message.type == aiohttp.WSMsgType.PONG:
                         pass
                     elif message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
+                        # aiohttp can report CLOSING/CLOSED with message.data=None and
+                        # close_code still unset. Do not turn that diagnostic event into
+                        # a misleading RuntimeError; capture the complete socket state
+                        # and let the context manager close/reconnect normally.
                         close_code = getattr(ws, "close_code", None)
                         close_reason = getattr(ws, "close_reason", None)
+                        ws_closed = getattr(ws, "closed", None)
+                        ws_exception = ws.exception()
                         close_detail = {
                             "message_type": type_name,
-                            "message_data": data_preview or None,
-                            "message_extra": extra_preview or None,
-                            "close_code": close_code,
-                            "close_reason": close_reason,
+                            "message_data": data_preview,
+                            "message_extra": extra_preview,
+                            "ws_closed": ws_closed,
+                            "ws_close_code": close_code,
+                            "ws_close_reason": close_reason,
+                            "ws_exception": repr(ws_exception) if ws_exception else None,
+                            "receive_wait_seconds": receive_elapsed,
                         }
                         detail = json.dumps(close_detail, ensure_ascii=False)
                         if kind == "orderbook":
                             self.ws_orderbook_last_close_type = type_name
                             self.ws_orderbook_last_close_message = detail
+                            self.ws_orderbook_close_code = close_code
+                            self.ws_orderbook_close_reason = close_reason
                             self.ws_orderbook_last_event = "closed"
+                            self.ws_orderbook_last_error = f"orderbook websocket closed: {detail}"
                         else:
                             self.ws_trade_last_close_type = type_name
                             self.ws_trade_last_close_message = detail
+                            self.ws_trade_close_code = close_code
+                            self.ws_trade_close_reason = close_reason
                             self.ws_trade_last_event = "closed"
+                            self.ws_trade_last_error = f"trades websocket closed: {detail}"
                         self.ws_last_close_type = type_name
                         self.ws_last_close_message = detail
                         self.ws_close_code = close_code
                         self.ws_close_reason = close_reason
-                        raise RuntimeError(f"{kind} websocket received {detail}")
+                        self.ws_last_event = "closed"
+                        self.ws_last_channel = channel
+                        self.ws_last_error = None if ws_exception is None else repr(ws_exception)
+                        self.ws_exception_type = None if ws_exception is None else type(ws_exception).__name__
+                        self.ws_exception_message = None if ws_exception is None else str(ws_exception)
+                        LOG.warning("Coincheck WS channel=%s close event: %s", kind, detail)
+                        return
                     elif message.type == aiohttp.WSMsgType.ERROR:
                         err = ws.exception()
                         detail = f"{kind} websocket ERROR type={type_name} data={data_preview!r} extra={extra_preview!r} exception={err!r}"
@@ -644,6 +688,8 @@ class CoincheckStream:
             "ws_raw_preview": self.ws_raw_preview,
             "ws_close_code": self.ws_close_code,
             "ws_close_reason": self.ws_close_reason,
+            "ws_receive_wait_started_ts": self.ws_receive_wait_started_ts,
+            "ws_receive_wait_seconds": self.ws_receive_wait_seconds,
             "ws_exception_type": self.ws_exception_type,
             "ws_exception_message": self.ws_exception_message,
             "ws_receive_type": self.ws_receive_type,
@@ -677,6 +723,10 @@ class CoincheckStream:
             "ws_orderbook_receive_extra_preview": self.ws_orderbook_receive_extra_preview,
             "ws_orderbook_last_close_type": self.ws_orderbook_last_close_type,
             "ws_orderbook_last_close_message": self.ws_orderbook_last_close_message,
+            "ws_orderbook_receive_wait_started_ts": self.ws_orderbook_receive_wait_started_ts,
+            "ws_orderbook_receive_wait_seconds": self.ws_orderbook_receive_wait_seconds,
+            "ws_orderbook_close_code": self.ws_orderbook_close_code,
+            "ws_orderbook_close_reason": self.ws_orderbook_close_reason,
             "ws_trade_connected": self.ws_trade_connected,
             "ws_trade_transport_connected": self.ws_trade_transport_connected,
             "ws_trade_active": self.ws_trade_active,
@@ -694,6 +744,10 @@ class CoincheckStream:
             "ws_trade_receive_extra_preview": self.ws_trade_receive_extra_preview,
             "ws_trade_last_close_type": self.ws_trade_last_close_type,
             "ws_trade_last_close_message": self.ws_trade_last_close_message,
+            "ws_trade_receive_wait_started_ts": self.ws_trade_receive_wait_started_ts,
+            "ws_trade_receive_wait_seconds": self.ws_trade_receive_wait_seconds,
+            "ws_trade_close_code": self.ws_trade_close_code,
+            "ws_trade_close_reason": self.ws_trade_close_reason,
             "rest_refresh_count": self.rest_refresh_count,
             "last_rest_refresh_ts": self.last_rest_refresh_ts,
             "rest_fail_count": self.rest_fail_count,
