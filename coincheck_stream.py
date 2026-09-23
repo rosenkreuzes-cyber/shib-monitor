@@ -15,6 +15,7 @@ RECONNECT_MAX = 30.0
 WS_STALE_SECONDS = 30.0
 WS_IDLE_SECONDS = 10.0
 WS_NO_DATA_RECONNECT_SECONDS = 25.0
+WS_CONNECT_GRACE_SECONDS = 8.0
 
 
 class CoincheckStream:
@@ -55,6 +56,11 @@ class CoincheckStream:
         self.ws_orderbook_close_reason = None
         self.ws_orderbook_reconnects = 0
         self.ws_orderbook_connection_started_ts = None
+        self.ws_orderbook_receive_type = None
+        self.ws_orderbook_receive_data_preview = None
+        self.ws_orderbook_receive_extra_preview = None
+        self.ws_orderbook_last_close_type = None
+        self.ws_orderbook_last_close_message = None
 
         self.ws_trade_connected = False
         self.ws_trade_transport_connected = False
@@ -70,6 +76,11 @@ class CoincheckStream:
         self.ws_trade_close_reason = None
         self.ws_trade_reconnects = 0
         self.ws_trade_connection_started_ts = None
+        self.ws_trade_receive_type = None
+        self.ws_trade_receive_data_preview = None
+        self.ws_trade_receive_extra_preview = None
+        self.ws_trade_last_close_type = None
+        self.ws_trade_last_close_message = None
 
         self.ws_subscribe_sent_ts = None
         self.ws_subscribe_ack_ts = None
@@ -82,6 +93,11 @@ class CoincheckStream:
         self.ws_close_reason = None
         self.ws_exception_type = None
         self.ws_exception_message = None
+        self.ws_receive_type = None
+        self.ws_receive_data_preview = None
+        self.ws_receive_extra_preview = None
+        self.ws_last_close_type = None
+        self.ws_last_close_message = None
 
         self.ws_trade_raw_preview = None
         self.ws_trade_parse_failures = 0
@@ -415,6 +431,22 @@ class CoincheckStream:
             try:
                 while not self._stopped:
                     message = await ws.receive()
+                    type_name = getattr(message.type, "name", str(message.type))
+                    data_preview = str(getattr(message, "data", ""))[:1000]
+                    extra_preview = str(getattr(message, "extra", ""))[:1000]
+
+                    if kind == "orderbook":
+                        self.ws_orderbook_receive_type = type_name
+                        self.ws_orderbook_receive_data_preview = data_preview or None
+                        self.ws_orderbook_receive_extra_preview = extra_preview or None
+                    else:
+                        self.ws_trade_receive_type = type_name
+                        self.ws_trade_receive_data_preview = data_preview or None
+                        self.ws_trade_receive_extra_preview = extra_preview or None
+                    self.ws_receive_type = type_name
+                    self.ws_receive_data_preview = data_preview or None
+                    self.ws_receive_extra_preview = extra_preview or None
+
                     if message.type == aiohttp.WSMsgType.TEXT:
                         if kind == "orderbook":
                             await self.handle_orderbook(message.data)
@@ -427,14 +459,40 @@ class CoincheckStream:
                         await ws.pong()
                     elif message.type == aiohttp.WSMsgType.PONG:
                         pass
-                    elif message.type in (
-                        aiohttp.WSMsgType.CLOSE,
-                        aiohttp.WSMsgType.CLOSED,
-                        aiohttp.WSMsgType.ERROR,
-                    ):
-                        raise RuntimeError(
-                            f"{kind} websocket closed type={message.type}"
-                        )
+                    elif message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
+                        close_code = getattr(ws, "close_code", None)
+                        close_reason = getattr(ws, "close_reason", None)
+                        close_detail = {
+                            "message_type": type_name,
+                            "message_data": data_preview or None,
+                            "message_extra": extra_preview or None,
+                            "close_code": close_code,
+                            "close_reason": close_reason,
+                        }
+                        detail = json.dumps(close_detail, ensure_ascii=False)
+                        if kind == "orderbook":
+                            self.ws_orderbook_last_close_type = type_name
+                            self.ws_orderbook_last_close_message = detail
+                            self.ws_orderbook_last_event = "closed"
+                        else:
+                            self.ws_trade_last_close_type = type_name
+                            self.ws_trade_last_close_message = detail
+                            self.ws_trade_last_event = "closed"
+                        self.ws_last_close_type = type_name
+                        self.ws_last_close_message = detail
+                        self.ws_close_code = close_code
+                        self.ws_close_reason = close_reason
+                        raise RuntimeError(f"{kind} websocket received {detail}")
+                    elif message.type == aiohttp.WSMsgType.ERROR:
+                        err = ws.exception()
+                        detail = f"{kind} websocket ERROR type={type_name} data={data_preview!r} extra={extra_preview!r} exception={err!r}"
+                        if kind == "orderbook":
+                            self.ws_orderbook_last_event = "receive_error"
+                            self.ws_orderbook_last_error = detail
+                        else:
+                            self.ws_trade_last_event = "receive_error"
+                            self.ws_trade_last_error = detail
+                        raise RuntimeError(detail)
             finally:
                 watchdog.cancel()
                 try:
@@ -454,8 +512,16 @@ class CoincheckStream:
                     kind,
                     self.pair,
                 )
+                before = self.now()
                 await self._ws_channel_session(session, kind)
-                delay = RECONNECT_INITIAL
+                # A clean return with no market data is not a healthy session.
+                # Keep backoff instead of hammering the endpoint.
+                if kind == "orderbook":
+                    active = self.ws_orderbook_active
+                else:
+                    active = self.ws_trade_active
+                if active or self.now() - before >= WS_CONNECT_GRACE_SECONDS:
+                    delay = RECONNECT_INITIAL
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -580,6 +646,11 @@ class CoincheckStream:
             "ws_close_reason": self.ws_close_reason,
             "ws_exception_type": self.ws_exception_type,
             "ws_exception_message": self.ws_exception_message,
+            "ws_receive_type": self.ws_receive_type,
+            "ws_receive_data_preview": self.ws_receive_data_preview,
+            "ws_receive_extra_preview": self.ws_receive_extra_preview,
+            "ws_last_close_type": self.ws_last_close_type,
+            "ws_last_close_message": self.ws_last_close_message,
             "ws_messages": self.ws_messages,
             "ws_orderbook_messages": self.ws_orderbook_messages,
             "ws_trade_messages": self.ws_trade_messages,
@@ -601,6 +672,11 @@ class CoincheckStream:
             "ws_orderbook_exception_message": self.ws_orderbook_exception_message,
             "ws_orderbook_reconnects": self.ws_orderbook_reconnects,
             "ws_orderbook_connection_started_ts": self.ws_orderbook_connection_started_ts,
+            "ws_orderbook_receive_type": self.ws_orderbook_receive_type,
+            "ws_orderbook_receive_data_preview": self.ws_orderbook_receive_data_preview,
+            "ws_orderbook_receive_extra_preview": self.ws_orderbook_receive_extra_preview,
+            "ws_orderbook_last_close_type": self.ws_orderbook_last_close_type,
+            "ws_orderbook_last_close_message": self.ws_orderbook_last_close_message,
             "ws_trade_connected": self.ws_trade_connected,
             "ws_trade_transport_connected": self.ws_trade_transport_connected,
             "ws_trade_active": self.ws_trade_active,
@@ -613,6 +689,11 @@ class CoincheckStream:
             "ws_trade_exception_message": self.ws_trade_exception_message,
             "ws_trade_reconnects": self.ws_trade_reconnects,
             "ws_trade_connection_started_ts": self.ws_trade_connection_started_ts,
+            "ws_trade_receive_type": self.ws_trade_receive_type,
+            "ws_trade_receive_data_preview": self.ws_trade_receive_data_preview,
+            "ws_trade_receive_extra_preview": self.ws_trade_receive_extra_preview,
+            "ws_trade_last_close_type": self.ws_trade_last_close_type,
+            "ws_trade_last_close_message": self.ws_trade_last_close_message,
             "rest_refresh_count": self.rest_refresh_count,
             "last_rest_refresh_ts": self.last_rest_refresh_ts,
             "rest_fail_count": self.rest_fail_count,
