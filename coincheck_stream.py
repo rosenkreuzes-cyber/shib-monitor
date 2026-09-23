@@ -18,6 +18,9 @@ WS_NO_DATA_RECONNECT_SECONDS = 25.0
 WS_CONNECT_GRACE_SECONDS = 8.0
 WS_RECEIVE_PREVIEW_LIMIT = 1000
 WS_TRADE_START_DELAY_SECONDS = 2.0
+# Fix22 diagnostic: first keep the upgraded socket open WITHOUT a subscribe.
+# If it survives this phase, send subscribe and observe whether the behavior changes.
+WS_PRE_SUBSCRIBE_TEST_SECONDS = 12.0
 
 
 class CoincheckStream:
@@ -116,6 +119,14 @@ class CoincheckStream:
         self.ws_receive_wait_seconds = None
 
         self.ws_trade_raw_preview = None
+        self.ws_orderbook_pre_subscribe_test_started_ts = None
+        self.ws_orderbook_pre_subscribe_test_elapsed_sec = None
+        self.ws_orderbook_pre_subscribe_result = None
+        self.ws_orderbook_post_subscribe_started_ts = None
+        self.ws_trade_pre_subscribe_test_started_ts = None
+        self.ws_trade_pre_subscribe_test_elapsed_sec = None
+        self.ws_trade_pre_subscribe_result = None
+        self.ws_trade_post_subscribe_started_ts = None
         self.ws_trade_parse_failures = 0
         self.ws_nontrade_list_messages = 0
         self.ws_last_data_state = "NEVER"
@@ -454,6 +465,116 @@ class CoincheckStream:
                 self.ws_trade_transport_connected = True
                 self.ws_trade_last_event = "transport_connected"
 
+            # FIX22: Diagnostic phase A. Do NOT subscribe immediately.
+            # This tells us whether Coincheck closes an otherwise idle upgraded
+            # WebSocket. If it survives, phase B sends the normal subscribe.
+            phase_a_start = self.now()
+            if kind == "orderbook":
+                self.ws_orderbook_pre_subscribe_test_started_ts = phase_a_start
+            else:
+                self.ws_trade_pre_subscribe_test_started_ts = phase_a_start
+
+            phase_a_deadline = phase_a_start + WS_PRE_SUBSCRIBE_TEST_SECONDS
+            while not self._stopped and self.now() < phase_a_deadline:
+                receive_started = self.now()
+                if kind == "orderbook":
+                    self.ws_orderbook_receive_wait_started_ts = receive_started
+                else:
+                    self.ws_trade_receive_wait_started_ts = receive_started
+                self.ws_receive_wait_started_ts = receive_started
+
+                try:
+                    message = await ws.receive(timeout=max(0.5, phase_a_deadline - receive_started))
+                except asyncio.TimeoutError:
+                    # No frame arrived before Phase A deadline. That is exactly
+                    # the result we want: the transport survived without subscribe.
+                    break
+                receive_elapsed = round(self.now() - receive_started, 3)
+                if kind == "orderbook":
+                    self.ws_orderbook_receive_wait_seconds = receive_elapsed
+                else:
+                    self.ws_trade_receive_wait_seconds = receive_elapsed
+                self.ws_receive_wait_seconds = receive_elapsed
+
+                type_name = getattr(message.type, "name", str(message.type))
+                data = getattr(message, "data", None)
+                extra = getattr(message, "extra", None)
+                data_preview = repr(data)[:WS_RECEIVE_PREVIEW_LIMIT] if data is not None else None
+                extra_preview = repr(extra)[:WS_RECEIVE_PREVIEW_LIMIT] if extra is not None else None
+                if kind == "orderbook":
+                    self.ws_orderbook_receive_type = type_name
+                    self.ws_orderbook_receive_data_preview = data_preview or None
+                    self.ws_orderbook_receive_extra_preview = extra_preview or None
+                else:
+                    self.ws_trade_receive_type = type_name
+                    self.ws_trade_receive_data_preview = data_preview or None
+                    self.ws_trade_receive_extra_preview = extra_preview or None
+                self.ws_receive_type = type_name
+                self.ws_receive_data_preview = data_preview or None
+                self.ws_receive_extra_preview = extra_preview or None
+
+                if message.type == aiohttp.WSMsgType.TEXT:
+                    # Unexpected server text before subscribe is still valuable.
+                    self.ws_messages += 1
+                    self.last_ws_message_ts = self.now()
+                    self.ws_raw_preview_type = "pre_subscribe:" + type(data).__name__
+                    self.ws_raw_preview = json.dumps(data, ensure_ascii=False)[:WS_RECEIVE_PREVIEW_LIMIT]
+                elif message.type == aiohttp.WSMsgType.BINARY:
+                    self.ws_messages += 1
+                    self.last_ws_message_ts = self.now()
+                elif message.type == aiohttp.WSMsgType.PING:
+                    await ws.pong()
+                elif message.type == aiohttp.WSMsgType.PONG:
+                    pass
+                elif message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
+                    close_code = getattr(ws, "close_code", None)
+                    close_reason = getattr(ws, "close_reason", None)
+                    ws_exception = ws.exception()
+                    detail = json.dumps({
+                        "message_type": type_name,
+                        "message_data": data_preview,
+                        "message_extra": extra_preview,
+                        "ws_closed": getattr(ws, "closed", None),
+                        "ws_close_code": close_code,
+                        "ws_close_reason": close_reason,
+                        "ws_exception": repr(ws_exception) if ws_exception else None,
+                        "phase": "pre_subscribe",
+                        "receive_wait_seconds": receive_elapsed,
+                    }, ensure_ascii=False)
+                    if kind == "orderbook":
+                        self.ws_orderbook_pre_subscribe_test_elapsed_sec = round(self.now()-phase_a_start,3)
+                        self.ws_orderbook_pre_subscribe_result = "CLOSED_BEFORE_SUBSCRIBE"
+                        self.ws_orderbook_last_close_type = type_name
+                        self.ws_orderbook_last_close_message = detail
+                        self.ws_orderbook_close_code = close_code
+                        self.ws_orderbook_close_reason = close_reason
+                        self.ws_orderbook_last_error = "orderbook websocket closed before subscribe: " + detail
+                        self.ws_orderbook_last_event = "closed_before_subscribe"
+                    else:
+                        self.ws_trade_pre_subscribe_test_elapsed_sec = round(self.now()-phase_a_start,3)
+                        self.ws_trade_pre_subscribe_result = "CLOSED_BEFORE_SUBSCRIBE"
+                        self.ws_trade_last_close_type = type_name
+                        self.ws_trade_last_close_message = detail
+                        self.ws_trade_close_code = close_code
+                        self.ws_trade_close_reason = close_reason
+                        self.ws_trade_last_error = "trades websocket closed before subscribe: " + detail
+                        self.ws_trade_last_event = "closed_before_subscribe"
+                    LOG.warning("Coincheck WS channel=%s closed during FIX22 pre-subscribe test: %s", kind, detail)
+                    return
+                elif message.type == aiohttp.WSMsgType.ERROR:
+                    raise RuntimeError(f"{kind} websocket ERROR during pre-subscribe test: {ws.exception()!r}")
+
+            phase_a_elapsed = round(self.now() - phase_a_start, 3)
+            if kind == "orderbook":
+                self.ws_orderbook_pre_subscribe_test_elapsed_sec = phase_a_elapsed
+                self.ws_orderbook_pre_subscribe_result = "SURVIVED_NO_SUBSCRIBE"
+                self.ws_orderbook_post_subscribe_started_ts = self.now()
+            else:
+                self.ws_trade_pre_subscribe_test_elapsed_sec = phase_a_elapsed
+                self.ws_trade_pre_subscribe_result = "SURVIVED_NO_SUBSCRIBE"
+                self.ws_trade_post_subscribe_started_ts = self.now()
+
+            # Phase B: now send the normal subscription.
             await self._subscribe(ws, channel, kind)
 
             if kind == "orderbook":
@@ -748,6 +869,14 @@ class CoincheckStream:
             "ws_trade_parse_failures": self.ws_trade_parse_failures,
             "ws_nontrade_list_messages": self.ws_nontrade_list_messages,
             "ws_trade_raw_preview": self.ws_trade_raw_preview,
+            "ws_orderbook_pre_subscribe_test_started_ts": self.ws_orderbook_pre_subscribe_test_started_ts,
+            "ws_orderbook_pre_subscribe_test_elapsed_sec": self.ws_orderbook_pre_subscribe_test_elapsed_sec,
+            "ws_orderbook_pre_subscribe_result": self.ws_orderbook_pre_subscribe_result,
+            "ws_orderbook_post_subscribe_started_ts": self.ws_orderbook_post_subscribe_started_ts,
+            "ws_trade_pre_subscribe_test_started_ts": self.ws_trade_pre_subscribe_test_started_ts,
+            "ws_trade_pre_subscribe_test_elapsed_sec": self.ws_trade_pre_subscribe_test_elapsed_sec,
+            "ws_trade_pre_subscribe_result": self.ws_trade_pre_subscribe_result,
+            "ws_trade_post_subscribe_started_ts": self.ws_trade_post_subscribe_started_ts,
             "last_ws_message_ts": self.last_ws_message_ts,
             "last_ws_orderbook_ts": self.last_ws_orderbook_ts,
             "last_ws_trade_ts": self.last_ws_trade_ts,
