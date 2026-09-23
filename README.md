@@ -1,18 +1,45 @@
-# SHIB Monitor API — renderfix16
+# SHIB Monitor API — RenderFix18
 
-Runtime files: main.py, coincheck_stream.py, analyzer.py, orderbook.py, requirements.txt, render.yaml.
+SHIB/JPY monitor using Coincheck REST as the primary data source and two independent WebSocket connections for realtime overlays.
 
-Fix16: REST is the primary 5-second data path; WebSocket is an independent realtime overlay with immediate receive loop and automatic reconnect. WS errors do not invalidate REST readiness.
+## Root files
 
-Render start command: python -m uvicorn main:app --host 0.0.0.0 --port $PORT
+- `main.py`
+- `coincheck_stream.py`
+- `analyzer.py`
+- `orderbook.py`
+- `requirements.txt`
+- `render.yaml`
+- `README.md`
 
-frontend/, backend/, and old app.py are not required.
+No `frontend/`, `backend/`, `app.py`, or cache folders are required.
 
+## Render
 
-## renderfix17
-- REST order book remains the primary freshness/decision source.
-- WebSocket freshness is separated from REST freshness.
-- `ws_data_state` distinguishes `LIVE`, `LIVE_TRADE`, `IDLE`, `STALE`, `CONNECTED_NO_DATA`, and `DISCONNECTED`.
-- Added trade diagnostics: `ws_trade_age_sec`, `ws_trade_parse_failures`, `ws_nontrade_list_messages`, and `ws_trade_raw_preview`.
-- A connected WebSocket that has simply stopped sending market updates no longer makes the main REST health state degraded.
-- Official Coincheck public WebSocket trade format is supported as a 2-dimensional array.
+Build command:
+
+```text
+pip install -r requirements.txt
+```
+
+Start command:
+
+```text
+python -m uvicorn main:app --host 0.0.0.0 --port $PORT
+```
+
+Health check:
+
+```text
+/api/health
+```
+
+## Fix18 changes
+
+- REST polling remains the primary source and runs every 5 seconds.
+- `shib_jpy-orderbook` and `shib_jpy-trades` now use separate WebSocket connections.
+- Each WS reconnects independently with exponential backoff.
+- A channel with no market-data message for 25 seconds is proactively closed and reconnected.
+- Subscription ACK is diagnostic only; lack of an ACK is not treated as proof of failure.
+- Health output exposes channel-specific connection, activity, error, and reconnect counters.
+- REST health/decision status remains independent of WebSocket status.

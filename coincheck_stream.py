@@ -2,155 +2,620 @@ import asyncio
 import json
 import logging
 from time import time
+
 import aiohttp
 
-LOG=logging.getLogger(__name__)
-REST_BASE="https://coincheck.com/api"
-WS_URL="wss://ws-api.coincheck.com/"
-REST_INTERVAL=5.0
-RECONNECT_INITIAL=2.0
-RECONNECT_MAX=30.0
-WS_STALE_SECONDS=30.0
-WS_IDLE_SECONDS=10.0
+LOG = logging.getLogger(__name__)
+
+REST_BASE = "https://coincheck.com/api"
+WS_URL = "wss://ws-api.coincheck.com/"
+REST_INTERVAL = 5.0
+RECONNECT_INITIAL = 2.0
+RECONNECT_MAX = 30.0
+WS_STALE_SECONDS = 30.0
+WS_IDLE_SECONDS = 10.0
+WS_NO_DATA_RECONNECT_SECONDS = 25.0
+
 
 class CoincheckStream:
-    def __init__(self,pair,analyzer,broadcast=None):
-        self.pair=pair; self.analyzer=analyzer; self._broadcast=broadcast; self._stopped=False
-        self.connected=False; self.transport_connected=False; self.subscribed=False
-        self.last_error=None; self.ws_last_error=None
-        self.ws_messages=0; self.ws_orderbook_messages=0; self.ws_trade_messages=0
-        self.last_ws_message_ts=None; self.last_ws_orderbook_ts=None; self.last_ws_trade_ts=None
-        self.ws_subscribe_sent_ts=None; self.ws_subscribe_ack_ts=None; self.ws_subscribe_error_ts=None
-        self.ws_last_event=None; self.ws_last_channel=None; self.ws_raw_preview_type=None; self.ws_raw_preview=None
-        self.ws_close_code=None; self.ws_close_reason=None; self.ws_exception_type=None; self.ws_exception_message=None
-        self.ws_trade_raw_preview=None; self.ws_trade_parse_failures=0; self.ws_nontrade_list_messages=0
-        self.ws_last_data_state="NEVER"
-        self.rest_refresh_count=0; self.last_rest_refresh_ts=None; self.rest_fail_count=0
-    def now(self): return time()
+    """REST-primary market stream with two independent Coincheck WS channels."""
+
+    def __init__(self, pair, analyzer, broadcast=None):
+        self.pair = pair
+        self.analyzer = analyzer
+        self._broadcast = broadcast
+        self._stopped = False
+
+        self.connected = False
+        self.transport_connected = False
+        self.subscribed = False
+        self.last_error = None
+        self.ws_last_error = None
+
+        self.ws_messages = 0
+        self.ws_orderbook_messages = 0
+        self.ws_trade_messages = 0
+        self.last_ws_message_ts = None
+        self.last_ws_orderbook_ts = None
+        self.last_ws_trade_ts = None
+
+        # Channel-specific diagnostics. An ACK is optional; Coincheck's public
+        # docs do not require a subscribe ACK, so *_active means market data arrived.
+        self.ws_orderbook_connected = False
+        self.ws_orderbook_transport_connected = False
+        self.ws_orderbook_active = False
+        self.ws_orderbook_subscribe_sent_ts = None
+        self.ws_orderbook_subscribe_ack_ts = None
+        self.ws_orderbook_subscribe_error_ts = None
+        self.ws_orderbook_last_event = None
+        self.ws_orderbook_last_error = None
+        self.ws_orderbook_exception_type = None
+        self.ws_orderbook_exception_message = None
+        self.ws_orderbook_close_code = None
+        self.ws_orderbook_close_reason = None
+        self.ws_orderbook_reconnects = 0
+        self.ws_orderbook_connection_started_ts = None
+
+        self.ws_trade_connected = False
+        self.ws_trade_transport_connected = False
+        self.ws_trade_active = False
+        self.ws_trade_subscribe_sent_ts = None
+        self.ws_trade_subscribe_ack_ts = None
+        self.ws_trade_subscribe_error_ts = None
+        self.ws_trade_last_event = None
+        self.ws_trade_last_error = None
+        self.ws_trade_exception_type = None
+        self.ws_trade_exception_message = None
+        self.ws_trade_close_code = None
+        self.ws_trade_close_reason = None
+        self.ws_trade_reconnects = 0
+        self.ws_trade_connection_started_ts = None
+
+        self.ws_subscribe_sent_ts = None
+        self.ws_subscribe_ack_ts = None
+        self.ws_subscribe_error_ts = None
+        self.ws_last_event = None
+        self.ws_last_channel = None
+        self.ws_raw_preview_type = None
+        self.ws_raw_preview = None
+        self.ws_close_code = None
+        self.ws_close_reason = None
+        self.ws_exception_type = None
+        self.ws_exception_message = None
+
+        self.ws_trade_raw_preview = None
+        self.ws_trade_parse_failures = 0
+        self.ws_nontrade_list_messages = 0
+        self.ws_last_data_state = "NEVER"
+
+        self.rest_refresh_count = 0
+        self.last_rest_refresh_ts = None
+        self.rest_fail_count = 0
+
+    def now(self):
+        return time()
+
     async def broadcast(self):
-        if self._broadcast is None:return
-        try:
-            r=self._broadcast()
-            if asyncio.iscoroutine(r): await r
-        except Exception: LOG.exception("broadcast failed")
-    async def rest_refresh(self,session):
-        try:
-            async with session.get(f"{REST_BASE}/order_books",params={"pair":self.pair}) as r:
-                r.raise_for_status(); d=await r.json(content_type=None)
-            bids=d.get("bids") or []; asks=d.get("asks") or []
-            if not bids or not asks: raise RuntimeError(f"empty orderbook bids={len(bids)} asks={len(asks)}")
-            self.analyzer.load_depth(d)
-            try:
-                async with session.get(f"{REST_BASE}/ticker",params={"pair":self.pair}) as r:
-                    r.raise_for_status(); t=await r.json(content_type=None)
-                if isinstance(t,dict): self.analyzer.ticker(t)
-            except Exception as e: LOG.warning("ticker refresh failed: %s",e)
-            try:
-                async with session.get(f"{REST_BASE}/trades",params={"pair":self.pair,"limit":20}) as r:
-                    r.raise_for_status(); tp=await r.json(content_type=None)
-                for row in (tp.get("data",[]) if isinstance(tp,dict) else []):
-                    if isinstance(row,dict): self.analyzer.trade({"executed_at":row.get("created_at",row.get("executed_at")),"id":row.get("id"),"pair":row.get("pair",self.pair),"price":row.get("price",row.get("rate")),"amount":row.get("amount"),"side":row.get("side",row.get("order_type"))})
-            except Exception as e: LOG.warning("trades refresh failed: %s",e)
-            self.last_error=None; self.analyzer.last_error=None; self.rest_refresh_count+=1; self.last_rest_refresh_ts=self.now()
-            await self.broadcast()
-        except asyncio.CancelledError: raise
-        except Exception as e:
-            self.last_error=str(e); self.analyzer.last_error=self.last_error; self.rest_fail_count+=1
-            LOG.warning("REST refresh failed: %s",e)
-    async def rest_loop(self,session):
-        while not self._stopped:
-            await self.rest_refresh(session); await asyncio.sleep(REST_INTERVAL)
-    async def subscribe(self,ws,ch):
-        await ws.send_str(json.dumps({"type":"subscribe","channel":ch}))
-        self.ws_subscribe_sent_ts=self.now(); self.ws_last_event=f"subscribe_sent:{ch}"
-    async def handle(self,text):
-        try: d=json.loads(text)
-        except Exception: return
-        self.ws_messages+=1; self.last_ws_message_ts=self.now(); self.ws_raw_preview_type=type(d).__name__; self.ws_raw_preview=json.dumps(d,ensure_ascii=False)[:1000]
-        if isinstance(d,dict):
-            typ=d.get("type")
-            if typ in ("subscribed","subscribe"):
-                self.ws_subscribe_ack_ts=self.now(); self.ws_last_event=f"subscribed:{d.get('channel')}"; self.subscribed=True; self.ws_last_channel=d.get("channel"); return
-            if typ in ("error","subscribe_error"):
-                self.ws_subscribe_error_ts=self.now(); self.ws_last_event="subscribe_error"; self.ws_last_error=str(d); self.analyzer.ws_last_error=self.ws_last_error; return
-        if isinstance(d,list) and len(d)>=2 and d[0]==self.pair and isinstance(d[1],dict):
-            p=d[1]
-            if "bids" in p or "asks" in p:
-                self.ws_orderbook_messages+=1; self.last_ws_orderbook_ts=self.now(); self.ws_last_channel=f"{self.pair}-orderbook"; self.ws_last_event="orderbook_received"
-                self.analyzer.diff_depth(p); self.analyzer.set_ws(True,None); self.ws_last_error=None; await self.broadcast()
+        if self._broadcast is None:
             return
-        if isinstance(d,list):
-            changed=False
-            matched_rows=0
-            for row in d:
-                if isinstance(row,list) and len(row)>=6 and row[2]==self.pair:
-                    matched_rows += 1
-                    self.ws_trade_raw_preview=json.dumps(row,ensure_ascii=False)[:1000]
-                    side=row[5]
-                    if side not in ("buy","sell"):
-                        self.ws_trade_parse_failures += 1
-                        self.ws_last_event="trade_parse_error"
-                        continue
-                    try:
-                        float(row[3]); float(row[4]); float(row[0])
-                    except (TypeError,ValueError):
-                        self.ws_trade_parse_failures += 1
-                        self.ws_last_event="trade_parse_error"
-                        continue
-                    self.ws_trade_messages+=1; self.last_ws_trade_ts=self.now(); self.ws_last_channel=f"{self.pair}-trades"; self.ws_last_event="trade_received"
-                    self.analyzer.trade({"executed_at":row[0],"id":row[1],"pair":row[2],"price":row[3],"amount":row[4],"side":row[5]}); changed=True
-            if matched_rows == 0:
-                self.ws_nontrade_list_messages += 1
-            if changed: self.analyzer.set_ws(True,None); self.ws_last_error=None; await self.broadcast()
-    async def ws_session(self,session):
-        async with session.ws_connect(WS_URL,heartbeat=20,autoping=True,autoclose=True,receive_timeout=None,timeout=15) as ws:
-            self.transport_connected=True; self.connected=True; self.ws_last_event="transport_connected"; self.analyzer.set_ws(True,None)
-            await self.subscribe(ws,f"{self.pair}-orderbook"); await self.subscribe(ws,f"{self.pair}-trades")
+        try:
+            result = self._broadcast()
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            LOG.exception("broadcast failed")
+
+    async def rest_refresh(self, session):
+        try:
+            async with session.get(
+                f"{REST_BASE}/order_books",
+                params={"pair": self.pair},
+            ) as response:
+                response.raise_for_status()
+                data = await response.json(content_type=None)
+
+            bids = data.get("bids") or []
+            asks = data.get("asks") or []
+            if not bids or not asks:
+                raise RuntimeError(
+                    f"empty orderbook bids={len(bids)} asks={len(asks)}"
+                )
+
+            self.analyzer.load_depth(data)
+
+            try:
+                async with session.get(
+                    f"{REST_BASE}/ticker",
+                    params={"pair": self.pair},
+                ) as response:
+                    response.raise_for_status()
+                    ticker = await response.json(content_type=None)
+                if isinstance(ticker, dict):
+                    self.analyzer.ticker(ticker)
+            except Exception as exc:
+                LOG.warning("ticker refresh failed: %s", exc)
+
+            try:
+                async with session.get(
+                    f"{REST_BASE}/trades",
+                    params={"pair": self.pair, "limit": 20},
+                ) as response:
+                    response.raise_for_status()
+                    trades = await response.json(content_type=None)
+
+                for row in (
+                    trades.get("data", []) if isinstance(trades, dict) else []
+                ):
+                    if isinstance(row, dict):
+                        self.analyzer.trade(
+                            {
+                                "executed_at": row.get(
+                                    "created_at", row.get("executed_at")
+                                ),
+                                "id": row.get("id"),
+                                "pair": row.get("pair", self.pair),
+                                "price": row.get("price", row.get("rate")),
+                                "amount": row.get("amount"),
+                                "side": row.get("side", row.get("order_type")),
+                            }
+                        )
+            except Exception as exc:
+                LOG.warning("trades refresh failed: %s", exc)
+
+            self.last_error = None
+            self.analyzer.last_error = None
+            self.rest_refresh_count += 1
+            self.last_rest_refresh_ts = self.now()
+            await self.broadcast()
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.analyzer.last_error = self.last_error
+            self.rest_fail_count += 1
+            LOG.warning("REST refresh failed: %s", exc)
+
+    async def rest_loop(self, session):
+        while not self._stopped:
+            await self.rest_refresh(session)
+            await asyncio.sleep(REST_INTERVAL)
+
+    async def _subscribe(self, ws, channel, kind):
+        await ws.send_str(
+            json.dumps({"type": "subscribe", "channel": channel})
+        )
+        ts = self.now()
+        self.ws_subscribe_sent_ts = ts
+        self.ws_last_event = f"subscribe_sent:{channel}"
+        self.ws_last_channel = channel
+        if kind == "orderbook":
+            self.ws_orderbook_subscribe_sent_ts = ts
+            self.ws_orderbook_last_event = "subscribe_sent"
+        else:
+            self.ws_trade_subscribe_sent_ts = ts
+            self.ws_trade_last_event = "subscribe_sent"
+
+    async def _handle_control(self, data, kind):
+        if not isinstance(data, dict):
+            return False
+
+        channel = data.get("channel")
+        typ = data.get("type")
+        if typ in ("subscribed", "subscribe"):
+            ts = self.now()
+            self.ws_subscribe_ack_ts = ts
+            self.ws_last_event = f"subscribed:{channel}"
+            self.ws_last_channel = channel
+            if kind == "orderbook":
+                self.ws_orderbook_subscribe_ack_ts = ts
+                self.ws_orderbook_last_event = "subscribed_ack"
+            else:
+                self.ws_trade_subscribe_ack_ts = ts
+                self.ws_trade_last_event = "subscribed_ack"
+            return True
+
+        if typ in ("error", "subscribe_error"):
+            ts = self.now()
+            error = json.dumps(data, ensure_ascii=False)[:1000]
+            self.ws_subscribe_error_ts = ts
+            self.ws_last_event = "subscribe_error"
+            self.ws_last_error = error
+            self.analyzer.ws_last_error = error
+            if kind == "orderbook":
+                self.ws_orderbook_subscribe_error_ts = ts
+                self.ws_orderbook_last_error = error
+                self.ws_orderbook_last_event = "subscribe_error"
+            else:
+                self.ws_trade_subscribe_error_ts = ts
+                self.ws_trade_last_error = error
+                self.ws_trade_last_event = "subscribe_error"
+            return True
+
+        return False
+
+    async def handle_orderbook(self, text):
+        try:
+            data = json.loads(text)
+        except Exception:
+            return False
+
+        self.ws_messages += 1
+        self.last_ws_message_ts = self.now()
+        self.ws_raw_preview_type = type(data).__name__
+        self.ws_raw_preview = json.dumps(
+            data, ensure_ascii=False
+        )[:1000]
+
+        if await self._handle_control(data, "orderbook"):
+            return False
+
+        if (
+            isinstance(data, list)
+            and len(data) >= 2
+            and data[0] == self.pair
+            and isinstance(data[1], dict)
+            and ("bids" in data[1] or "asks" in data[1])
+        ):
+            ts = self.now()
+            self.ws_orderbook_messages += 1
+            self.last_ws_orderbook_ts = ts
+            self.ws_orderbook_active = True
+            self.ws_last_channel = f"{self.pair}-orderbook"
+            self.ws_last_event = "orderbook_received"
+            self.ws_orderbook_last_event = "data_received"
+            self.ws_orderbook_last_error = None
+            self.ws_last_error = None
+            self.analyzer.diff_depth(data[1])
+            self.analyzer.set_ws(True, None)
+            await self.broadcast()
+            return True
+
+        return False
+
+    async def handle_trade(self, text):
+        try:
+            data = json.loads(text)
+        except Exception:
+            return False
+
+        self.ws_messages += 1
+        self.last_ws_message_ts = self.now()
+        self.ws_raw_preview_type = type(data).__name__
+        self.ws_raw_preview = json.dumps(
+            data, ensure_ascii=False
+        )[:1000]
+
+        if await self._handle_control(data, "trade"):
+            return False
+
+        if not isinstance(data, list):
+            return False
+
+        changed = False
+        matched = 0
+        for row in data:
+            if not (
+                isinstance(row, list)
+                and len(row) >= 6
+                and row[2] == self.pair
+            ):
+                continue
+
+            matched += 1
+            self.ws_trade_raw_preview = json.dumps(
+                row, ensure_ascii=False
+            )[:1000]
+            side = row[5]
+            try:
+                float(row[0])
+                float(row[3])
+                float(row[4])
+            except (TypeError, ValueError):
+                self.ws_trade_parse_failures += 1
+                self.ws_trade_last_event = "trade_parse_error"
+                continue
+
+            if side not in ("buy", "sell"):
+                self.ws_trade_parse_failures += 1
+                self.ws_trade_last_event = "trade_parse_error"
+                continue
+
+            ts = self.now()
+            self.ws_trade_messages += 1
+            self.last_ws_trade_ts = ts
+            self.ws_trade_active = True
+            self.ws_last_channel = f"{self.pair}-trades"
+            self.ws_last_event = "trade_received"
+            self.ws_trade_last_event = "data_received"
+            self.ws_trade_last_error = None
+            self.ws_last_error = None
+            self.analyzer.trade(
+                {
+                    "executed_at": row[0],
+                    "id": row[1],
+                    "pair": row[2],
+                    "price": row[3],
+                    "amount": row[4],
+                    "side": row[5],
+                }
+            )
+            changed = True
+
+        if matched == 0:
+            self.ws_nontrade_list_messages += 1
+        if changed:
+            self.analyzer.set_ws(True, None)
+            await self.broadcast()
+        return changed
+
+    async def _watchdog(self, ws, kind, get_last_data):
+        try:
             while not self._stopped:
-                m=await ws.receive()
-                if m.type==aiohttp.WSMsgType.TEXT: await self.handle(m.data)
-                elif m.type==aiohttp.WSMsgType.BINARY: self.ws_messages+=1; self.last_ws_message_ts=self.now()
-                elif m.type==aiohttp.WSMsgType.PING: await ws.pong()
-                elif m.type==aiohttp.WSMsgType.PONG: pass
-                elif m.type in (aiohttp.WSMsgType.CLOSE,aiohttp.WSMsgType.CLOSED,aiohttp.WSMsgType.ERROR): raise RuntimeError(f"websocket closed type={m.type}")
-    async def ws_loop(self,session):
-        delay=RECONNECT_INITIAL
+                await asyncio.sleep(5)
+                last = get_last_data()
+                if last is None:
+                    started = (
+                        self.ws_orderbook_connection_started_ts
+                        if kind == "orderbook"
+                        else self.ws_trade_connection_started_ts
+                    )
+                    elapsed = self.now() - (started or self.now())
+                else:
+                    elapsed = self.now() - last
+                if elapsed >= WS_NO_DATA_RECONNECT_SECONDS:
+                    message = (
+                        f"{kind} websocket market-data idle for "
+                        f"{elapsed:.1f}s; reconnecting"
+                    )
+                    if kind == "orderbook":
+                        self.ws_orderbook_last_event = "watchdog_reconnect"
+                        self.ws_orderbook_last_error = message
+                    else:
+                        self.ws_trade_last_event = "watchdog_reconnect"
+                        self.ws_trade_last_error = message
+                    LOG.warning(message)
+                    await ws.close(code=1000, message=b"market data idle")
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    async def _ws_channel_session(self, session, kind):
+        channel = f"{self.pair}-{kind}"
+        async with session.ws_connect(
+            WS_URL,
+            heartbeat=20,
+            autoping=True,
+            autoclose=True,
+            receive_timeout=None,
+            timeout=15,
+        ) as ws:
+            started_ts = self.now()
+            if kind == "orderbook":
+                self.ws_orderbook_connection_started_ts = started_ts
+                self.ws_orderbook_connected = True
+                self.ws_orderbook_transport_connected = True
+                self.ws_orderbook_last_event = "transport_connected"
+            else:
+                self.ws_trade_connection_started_ts = started_ts
+                self.ws_trade_connected = True
+                self.ws_trade_transport_connected = True
+                self.ws_trade_last_event = "transport_connected"
+
+            await self._subscribe(ws, channel, kind)
+
+            if kind == "orderbook":
+                get_last = lambda: self.last_ws_orderbook_ts
+            else:
+                get_last = lambda: self.last_ws_trade_ts
+            watchdog = asyncio.create_task(
+                self._watchdog(ws, kind, get_last)
+            )
+
+            try:
+                while not self._stopped:
+                    message = await ws.receive()
+                    if message.type == aiohttp.WSMsgType.TEXT:
+                        if kind == "orderbook":
+                            await self.handle_orderbook(message.data)
+                        else:
+                            await self.handle_trade(message.data)
+                    elif message.type == aiohttp.WSMsgType.BINARY:
+                        self.ws_messages += 1
+                        self.last_ws_message_ts = self.now()
+                    elif message.type == aiohttp.WSMsgType.PING:
+                        await ws.pong()
+                    elif message.type == aiohttp.WSMsgType.PONG:
+                        pass
+                    elif message.type in (
+                        aiohttp.WSMsgType.CLOSE,
+                        aiohttp.WSMsgType.CLOSED,
+                        aiohttp.WSMsgType.ERROR,
+                    ):
+                        raise RuntimeError(
+                            f"{kind} websocket closed type={message.type}"
+                        )
+            finally:
+                watchdog.cancel()
+                try:
+                    await watchdog
+                except asyncio.CancelledError:
+                    pass
+
+                self.ws_close_code = getattr(ws, "close_code", None)
+                self.ws_close_reason = getattr(ws, "close_reason", None)
+
+    async def ws_channel_loop(self, session, kind):
+        delay = RECONNECT_INITIAL
         while not self._stopped:
             try:
-                LOG.info("Coincheck WS connecting %s pair=%s",WS_URL,self.pair)
-                await self.ws_session(session); delay=RECONNECT_INITIAL
-            except asyncio.CancelledError: raise
-            except Exception as e:
-                self.connected=False; self.transport_connected=False; self.subscribed=False; self.ws_exception_type=type(e).__name__; self.ws_exception_message=str(e); self.ws_last_error=str(e); self.analyzer.set_ws(False,self.ws_last_error)
-                LOG.warning("Coincheck WS disconnected: %s",e); await self.broadcast(); await asyncio.sleep(delay); delay=min(delay*2,RECONNECT_MAX)
+                LOG.info(
+                    "Coincheck WS connecting channel=%s pair=%s",
+                    kind,
+                    self.pair,
+                )
+                await self._ws_channel_session(session, kind)
+                delay = RECONNECT_INITIAL
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                error = str(exc)
+                if kind == "orderbook":
+                    self.ws_orderbook_connected = False
+                    self.ws_orderbook_transport_connected = False
+                    self.ws_orderbook_exception_type = type(exc).__name__
+                    self.ws_orderbook_exception_message = error
+                    self.ws_orderbook_last_error = error
+                    self.ws_orderbook_reconnects += 1
+                else:
+                    self.ws_trade_connected = False
+                    self.ws_trade_transport_connected = False
+                    self.ws_trade_exception_type = type(exc).__name__
+                    self.ws_trade_exception_message = error
+                    self.ws_trade_last_error = error
+                    self.ws_trade_reconnects += 1
+
+                self.ws_last_error = error
+                self.ws_exception_type = type(exc).__name__
+                self.ws_exception_message = error
+                LOG.warning(
+                    "Coincheck WS channel=%s disconnected: %s",
+                    kind,
+                    exc,
+                )
+                await self.broadcast()
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, RECONNECT_MAX)
             finally:
-                self.connected=False; self.transport_connected=False; self.subscribed=False
+                if kind == "orderbook":
+                    self.ws_orderbook_connected = False
+                    self.ws_orderbook_transport_connected = False
+                else:
+                    self.ws_trade_connected = False
+                    self.ws_trade_transport_connected = False
+
     async def run(self):
-        timeout=aiohttp.ClientTimeout(total=None,connect=15,sock_connect=15,sock_read=None)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            rt=asyncio.create_task(self.rest_loop(s)); wt=asyncio.create_task(self.ws_loop(s))
-            try: await asyncio.gather(rt,wt)
+        timeout = aiohttp.ClientTimeout(
+            total=None,
+            connect=15,
+            sock_connect=15,
+            sock_read=None,
+        )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            tasks = [
+                asyncio.create_task(self.rest_loop(session)),
+                asyncio.create_task(self.ws_channel_loop(session, "orderbook")),
+                asyncio.create_task(self.ws_channel_loop(session, "trades")),
+            ]
+            try:
+                await asyncio.gather(*tasks)
             finally:
-                self._stopped=True; rt.cancel(); wt.cancel()
-                for t in (rt,wt):
-                    try: await t
-                    except asyncio.CancelledError: pass
+                self._stopped = True
+                for task in tasks:
+                    task.cancel()
+                for task in tasks:
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
     def health(self):
-        n=self.now(); age=lambda x: round(n-x,3) if x else None
-        msg_age=age(self.last_ws_message_ts)
-        ob_age=age(self.last_ws_orderbook_ts)
-        trade_age=age(self.last_ws_trade_ts)
-        if not self.connected:
-            data_state="DISCONNECTED"
+        now = self.now()
+
+        def age(value):
+            return round(now - value, 3) if value else None
+
+        msg_age = age(self.last_ws_message_ts)
+        ob_age = age(self.last_ws_orderbook_ts)
+        trade_age = age(self.last_ws_trade_ts)
+
+        any_connected = (
+            self.ws_orderbook_connected or self.ws_trade_connected
+        )
+        any_live = (
+            ob_age is not None and ob_age <= WS_IDLE_SECONDS
+        ) or (
+            trade_age is not None and trade_age <= WS_IDLE_SECONDS
+        )
+
+        if not any_connected:
+            data_state = "DISCONNECTED"
+        elif any_live:
+            data_state = "LIVE"
         elif ob_age is None and trade_age is None:
-            data_state="CONNECTED_NO_DATA"
-        elif ob_age is not None and ob_age <= WS_IDLE_SECONDS:
-            data_state="LIVE"
-        elif trade_age is not None and trade_age <= WS_IDLE_SECONDS:
-            data_state="LIVE_TRADE"
-        elif ob_age is not None and ob_age <= WS_STALE_SECONDS:
-            data_state="IDLE"
+            data_state = "CONNECTED_NO_DATA"
+        elif (
+            ob_age is not None and ob_age <= WS_STALE_SECONDS
+        ) or (
+            trade_age is not None and trade_age <= WS_STALE_SECONDS
+        ):
+            data_state = "IDLE"
         else:
-            data_state="STALE"
-        self.ws_last_data_state=data_state
-        return {"ws_transport_connected":self.transport_connected,"ws_connected":self.connected,"ws_subscribed":self.subscribed,"ws_age_sec":msg_age,"ws_orderbook_age_sec":ob_age,"ws_trade_age_sec":trade_age,"ws_data_state":data_state,"ws_subscribe_sent_ts":self.ws_subscribe_sent_ts,"ws_subscribe_ack_ts":self.ws_subscribe_ack_ts,"ws_subscribe_error_ts":self.ws_subscribe_error_ts,"ws_last_event":self.ws_last_event,"ws_last_channel":self.ws_last_channel,"ws_raw_preview_type":self.ws_raw_preview_type,"ws_raw_preview":self.ws_raw_preview,"ws_close_code":self.ws_close_code,"ws_close_reason":self.ws_close_reason,"ws_exception_type":self.ws_exception_type,"ws_exception_message":self.ws_exception_message,"ws_messages":self.ws_messages,"ws_orderbook_messages":self.ws_orderbook_messages,"ws_trade_messages":self.ws_trade_messages,"ws_trade_parse_failures":self.ws_trade_parse_failures,"ws_nontrade_list_messages":self.ws_nontrade_list_messages,"ws_trade_raw_preview":self.ws_trade_raw_preview,"last_ws_message_ts":self.last_ws_message_ts,"last_ws_orderbook_ts":self.last_ws_orderbook_ts,"last_ws_trade_ts":self.last_ws_trade_ts,"rest_refresh_count":self.rest_refresh_count,"last_rest_refresh_ts":self.last_rest_refresh_ts,"rest_fail_count":self.rest_fail_count,"rest_last_error":self.last_error,"ws_last_error":self.ws_last_error}
+            data_state = "STALE"
+
+        self.ws_last_data_state = data_state
+        self.connected = any_connected
+        self.transport_connected = (
+            self.ws_orderbook_transport_connected
+            or self.ws_trade_transport_connected
+        )
+        self.subscribed = self.ws_orderbook_active or self.ws_trade_active
+
+        return {
+            "ws_transport_connected": self.transport_connected,
+            "ws_connected": self.connected,
+            "ws_subscribed": self.subscribed,
+            "ws_age_sec": msg_age,
+            "ws_orderbook_age_sec": ob_age,
+            "ws_trade_age_sec": trade_age,
+            "ws_data_state": data_state,
+            "ws_subscribe_sent_ts": self.ws_subscribe_sent_ts,
+            "ws_subscribe_ack_ts": self.ws_subscribe_ack_ts,
+            "ws_subscribe_error_ts": self.ws_subscribe_error_ts,
+            "ws_last_event": self.ws_last_event,
+            "ws_last_channel": self.ws_last_channel,
+            "ws_raw_preview_type": self.ws_raw_preview_type,
+            "ws_raw_preview": self.ws_raw_preview,
+            "ws_close_code": self.ws_close_code,
+            "ws_close_reason": self.ws_close_reason,
+            "ws_exception_type": self.ws_exception_type,
+            "ws_exception_message": self.ws_exception_message,
+            "ws_messages": self.ws_messages,
+            "ws_orderbook_messages": self.ws_orderbook_messages,
+            "ws_trade_messages": self.ws_trade_messages,
+            "ws_trade_parse_failures": self.ws_trade_parse_failures,
+            "ws_nontrade_list_messages": self.ws_nontrade_list_messages,
+            "ws_trade_raw_preview": self.ws_trade_raw_preview,
+            "last_ws_message_ts": self.last_ws_message_ts,
+            "last_ws_orderbook_ts": self.last_ws_orderbook_ts,
+            "last_ws_trade_ts": self.last_ws_trade_ts,
+            "ws_orderbook_connected": self.ws_orderbook_connected,
+            "ws_orderbook_transport_connected": self.ws_orderbook_transport_connected,
+            "ws_orderbook_active": self.ws_orderbook_active,
+            "ws_orderbook_subscribe_sent_ts": self.ws_orderbook_subscribe_sent_ts,
+            "ws_orderbook_subscribe_ack_ts": self.ws_orderbook_subscribe_ack_ts,
+            "ws_orderbook_subscribe_error_ts": self.ws_orderbook_subscribe_error_ts,
+            "ws_orderbook_last_event": self.ws_orderbook_last_event,
+            "ws_orderbook_last_error": self.ws_orderbook_last_error,
+            "ws_orderbook_exception_type": self.ws_orderbook_exception_type,
+            "ws_orderbook_exception_message": self.ws_orderbook_exception_message,
+            "ws_orderbook_reconnects": self.ws_orderbook_reconnects,
+            "ws_orderbook_connection_started_ts": self.ws_orderbook_connection_started_ts,
+            "ws_trade_connected": self.ws_trade_connected,
+            "ws_trade_transport_connected": self.ws_trade_transport_connected,
+            "ws_trade_active": self.ws_trade_active,
+            "ws_trade_subscribe_sent_ts": self.ws_trade_subscribe_sent_ts,
+            "ws_trade_subscribe_ack_ts": self.ws_trade_subscribe_ack_ts,
+            "ws_trade_subscribe_error_ts": self.ws_trade_subscribe_error_ts,
+            "ws_trade_last_event": self.ws_trade_last_event,
+            "ws_trade_last_error": self.ws_trade_last_error,
+            "ws_trade_exception_type": self.ws_trade_exception_type,
+            "ws_trade_exception_message": self.ws_trade_exception_message,
+            "ws_trade_reconnects": self.ws_trade_reconnects,
+            "ws_trade_connection_started_ts": self.ws_trade_connection_started_ts,
+            "rest_refresh_count": self.rest_refresh_count,
+            "last_rest_refresh_ts": self.last_rest_refresh_ts,
+            "rest_fail_count": self.rest_fail_count,
+            "rest_last_error": self.last_error,
+            "ws_last_error": self.ws_last_error,
+        }
