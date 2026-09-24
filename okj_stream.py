@@ -1,311 +1,85 @@
-import asyncio
-import json
-import logging
-import time
-from typing import Optional
-
+import asyncio,json
+from time import time
 import aiohttp
 
-LOG = logging.getLogger("okj")
-
-REST = "https://api.okj.com"
-WS = "wss://ws.okj.com:443/ws/v5/public"
-INST_ID = "SHIB-JPY"
-PAIR = "shib_jpy"
-VERSION = "5.5-okj"
-
-RECONNECT_INITIAL = 1.0
-RECONNECT_MAX = 20.0
-NO_DATA_RECONNECT = 35.0
-
+WS="wss://ws.okj.com:443/ws/v5/public"
+REST="https://api.okj.com"
 
 class OKJStream:
-    """OKJ public market-data stream for SHIB-JPY.
+    def __init__(self,pair,analyzer,broadcast=None):
+        self.inst_id="SHIB-JPY"; self.a=analyzer; self.broadcast=broadcast
+        self.connected=False; self.ws_transport_connected=False; self.ws_subscribed=False
+        self.ws_data_state="DISCONNECTED"; self.ws_last_event=None; self.last_error=None
+        self.ws_messages=0; self.ws_orderbook_messages=0; self.ws_trade_messages=0
+        self.ws_ticker_messages=0; self.ws_subscribe_messages=0; self.ws_error_messages=0
+        self.ws_reconnects=0; self.last_ws_trade_ts=None; self.last_ws_ticker_ts=None
+        self.last_ws_orderbook_ts=None; self.last_ws_message_ts=None
+        self.last_seq_id=None; self.last_prev_seq_id=None; self.last_checksum=None; self.last_action=None
+        self.ws_raw_preview=None; self._stop=False
 
-    Design:
-      - WebSocket is the primary market-data source.
-      - books gives a full snapshot then incremental updates.
-      - trades gives aggregated public trades.
-      - tickers keeps last/best bid/ask current.
-      - REST is only a recovery/bootstrap fallback.
-      - Sequence/checksum metadata is retained for diagnostics.
-    """
+    async def emit(self):
+        if self.broadcast:
+            try: await self.broadcast()
+            except Exception: pass
 
-    def __init__(self, pair, analyzer, broadcast=None):
-        self.pair = pair
-        self.inst_id = INST_ID
-        self.analyzer = analyzer
-        self._broadcast = broadcast
-
-        self.connected = False
-        self.subscribed = False
-        self.last_error = None
-
-        self.ws_messages = 0
-        self.ws_orderbook_messages = 0
-        self.ws_trade_messages = 0
-        self.ws_ticker_messages = 0
-        self.ws_subscribe_messages = 0
-        self.ws_error_messages = 0
-        self.ws_reconnects = 0
-
-        self.last_ws_message_ts = None
-        self.last_ws_orderbook_ts = None
-        self.last_ws_trade_ts = None
-        self.last_ws_ticker_ts = None
-        self.last_pong_ts = None
-        self.last_subscribe_ts = None
-        self.last_snapshot_ts = None
-        self.last_seq_id = None
-        self.last_prev_seq_id = None
-        self.last_checksum = None
-        self.last_action = None
-        self.last_raw_preview = None
-        self.last_ws_error = None
-        self.ws_close_code = None
-        self.ws_close_reason = None
-
-    async def broadcast(self):
-        if self._broadcast is None:
-            return
+    async def bootstrap(self):
         try:
-            result = self._broadcast()
-            if asyncio.iscoroutine(result):
-                await result
-        except Exception:
-            LOG.exception("broadcast failed")
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+                async with s.get(f"{REST}/api/v5/market/books",params={"instId":self.inst_id,"sz":"400"}) as r:
+                    p=await r.json()
+                x=(p.get("data") or [{}])[0]
+                self.a.book.load_snapshot(x.get("bids",[]),x.get("asks",[]),None,x.get("ts"))
+                async with s.get(f"{REST}/api/v5/market/ticker",params={"instId":self.inst_id}) as r:
+                    p=await r.json()
+                x=(p.get("data") or [{}])[0]; self.a.ticker({"last":x.get("last")})
+                self.a.set_source("okj_rest"); await self.emit()
+        except Exception as e: self.last_error=str(e)
 
-    async def rest_bootstrap(self, session):
-        """Bootstrap from OKJ REST if WS snapshot has not arrived yet."""
-        try:
-            async with session.get(
-                f"{REST}/api/v5/market/books",
-                params={"instId": self.inst_id, "sz": "400"},
-            ) as resp:
-                resp.raise_for_status()
-                payload = await resp.json(content_type=None)
+    async def subscribe(self,ws):
+        m={"op":"subscribe","args":[{"channel":"books","instId":self.inst_id},{"channel":"trades","instId":self.inst_id},{"channel":"tickers","instId":self.inst_id}]}
+        await ws.send_str(json.dumps(m,separators=(",",":"))); self.ws_subscribe_messages=3
+        self.ws_subscribed=True; self.ws_last_event="subscribe_sent"
 
-            rows = payload.get("data") or []
-            if rows:
-                book = rows[0]
-                self.analyzer.load_okj_book(book)
-                self.last_snapshot_ts = time.time()
-                LOG.info(
-                    "OKJ REST bootstrap: bids=%d asks=%d",
-                    len(book.get("bids") or []),
-                    len(book.get("asks") or []),
-                )
+    async def handle(self,raw):
+        if raw=="pong": return
+        m=json.loads(raw); self.ws_messages+=1; self.last_ws_message_ts=time(); self.ws_raw_preview=raw[:3000]
+        if m.get("event")=="subscribe": self.ws_subscribed=True; self.ws_data_state="SUBSCRIBED"; return
+        if m.get("event")=="error": self.ws_error_messages+=1; self.last_error=f'{m.get("code")}: {m.get("msg")}'; return
+        ch=(m.get("arg") or {}).get("channel"); data=m.get("data") or []
+        if ch=="books":
+            x=data[0]; self.last_action=m.get("action"); self.last_seq_id=x.get("seqId"); self.last_prev_seq_id=x.get("prevSeqId"); self.last_checksum=x.get("checksum")
+            if m.get("action")=="snapshot": self.a.book.load_snapshot(x.get("bids",[]),x.get("asks",[]),x.get("seqId"),x.get("ts"))
+            else:
+                local=self.a.book.last_sequence
+                if local is not None and x.get("prevSeqId") is not None and int(x["prevSeqId"])!=int(local): raise RuntimeError("orderbook sequence gap")
+                self.a.book.apply_diff(x.get("bids",[]),x.get("asks",[]),x.get("seqId"),x.get("ts"))
+            self.ws_orderbook_messages+=1; self.last_ws_orderbook_ts=time(); self.ws_data_state="LIVE"; self.a.set_source("okj_ws_orderbook"); await self.emit()
+        elif ch=="trades":
+            for x in data:
+                self.a.trade({"id":x.get("tradeId"),"price":x.get("px"),"amount":x.get("sz"),"side":x.get("side"),"executed_at":x.get("ts")})
+                self.ws_trade_messages+=1; self.last_ws_trade_ts=time()
+            self.a.set_source("okj_ws_trade"); await self.emit()
+        elif ch=="tickers":
+            for x in data: self.a.ticker({"last":x.get("last")})
+            self.ws_ticker_messages+=len(data); self.last_ws_ticker_ts=time(); await self.emit()
 
-            async with session.get(
-                f"{REST}/api/v5/market/ticker",
-                params={"instId": self.inst_id},
-            ) as resp:
-                resp.raise_for_status()
-                payload = await resp.json(content_type=None)
-
-            rows = payload.get("data") or []
-            if rows:
-                self.analyzer.ticker_okj(rows[0])
-
-            self.analyzer.set_source("okj_rest_bootstrap")
-            await self.broadcast()
-        except Exception as exc:
-            self.last_error = str(exc)
-            LOG.warning("OKJ REST bootstrap failed: %s", exc)
-
-    async def _subscribe(self, ws):
-        args = [
-            {"channel": "books", "instId": self.inst_id},
-            {"channel": "trades", "instId": self.inst_id},
-            {"channel": "tickers", "instId": self.inst_id},
-        ]
-        await ws.send_json({"op": "subscribe", "args": args})
-        self.subscribed = True
-        self.last_subscribe_ts = time.time()
-        LOG.info("OKJ subscribe sent: %s", args)
-
-    async def _ping_loop(self, ws):
-        while True:
-            await asyncio.sleep(15)
-            if ws.closed:
-                return
-            await ws.send_str("ping")
-            self.last_action = "ping"
+    async def once(self):
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as s:
+            async with s.ws_connect(WS,heartbeat=None,autoping=True,receive_timeout=None) as ws:
+                self.connected=self.ws_transport_connected=True; self.ws_data_state="CONNECTED_NO_DATA"; self.a.set_ws(True)
+                await self.subscribe(ws)
+                while not self._stop:
+                    try: m=await asyncio.wait_for(ws.receive(),15)
+                    except asyncio.TimeoutError: await ws.send_str("ping"); continue
+                    if m.type==aiohttp.WSMsgType.TEXT: await self.handle(m.data)
+                    elif m.type in (aiohttp.WSMsgType.CLOSED,aiohttp.WSMsgType.ERROR): raise RuntimeError("websocket closed")
 
     async def run(self):
-        delay = RECONNECT_INITIAL
-
-        while True:
-            session = None
-            try:
-                timeout = aiohttp.ClientTimeout(
-                    total=None,
-                    connect=15,
-                    sock_connect=15,
-                    sock_read=None,
-                )
-                session = aiohttp.ClientSession(timeout=timeout)
-                await self.rest_bootstrap(session)
-
-                LOG.info("Connecting OKJ WS: %s", WS)
-                async with session.ws_connect(
-                    WS,
-                    heartbeat=None,
-                    autoping=False,
-                    timeout=15,
-                    max_msg_size=8 * 1024 * 1024,
-                ) as ws:
-                    self.connected = True
-                    self.subscribed = False
-                    self.last_error = None
-                    self.last_ws_error = None
-                    self.ws_close_code = None
-                    self.ws_close_reason = None
-                    self.analyzer.set_ws(True, None)
-                    delay = RECONNECT_INITIAL
-
-                    await self._subscribe(ws)
-                    ping_task = asyncio.create_task(self._ping_loop(ws))
-                    try:
-                        async for msg in ws:
-                            self.last_ws_message_ts = time.time()
-                            self.ws_messages += 1
-
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                text = msg.data
-                                if text == "pong":
-                                    self.last_pong_ts = time.time()
-                                    continue
-                                await self.handle(text)
-
-                            elif msg.type == aiohttp.WSMsgType.BINARY:
-                                try:
-                                    await self.handle(msg.data.decode())
-                                except Exception:
-                                    LOG.warning("OKJ binary frame could not be decoded")
-
-                            elif msg.type == aiohttp.WSMsgType.PING:
-                                await ws.pong()
-                                self.last_pong_ts = time.time()
-
-                            elif msg.type == aiohttp.WSMsgType.PONG:
-                                self.last_pong_ts = time.time()
-
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                self.ws_close_code = ws.close_code
-                                self.ws_close_reason = str(msg.extra)
-                                break
-
-                            if self.last_ws_message_ts and (
-                                time.time() - self.last_ws_message_ts > NO_DATA_RECONNECT
-                            ):
-                                break
-                    finally:
-                        ping_task.cancel()
-                        try:
-                            await ping_task
-                        except asyncio.CancelledError:
-                            pass
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.last_error = str(exc)
-                self.last_ws_error = str(exc)
-                LOG.exception("OKJ stream error; reconnect in %.1fs", delay)
-            finally:
-                self.connected = False
-                self.subscribed = False
-                self.analyzer.set_ws(False, self.last_error)
-                self.ws_reconnects += 1
-                await self.broadcast()
-                if session is not None:
-                    await session.close()
-
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, RECONNECT_MAX)
-
-    async def handle(self, text):
-        try:
-            data = json.loads(text)
-        except Exception as exc:
-            self.last_ws_error = f"invalid JSON: {exc}"
-            return
-
-        self.last_raw_preview = text[:1000]
-
-        if not isinstance(data, dict):
-            return
-
-        event = data.get("event")
-        if event == "subscribe":
-            self.ws_subscribe_messages += 1
-            LOG.info("OKJ subscribe ACK: %s", data.get("arg"))
-            return
-
-        if event == "error":
-            self.ws_error_messages += 1
-            self.last_ws_error = f"{data.get('code')}: {data.get('msg')}"
-            LOG.error("OKJ WS subscription error: %s", self.last_ws_error)
-            return
-
-        arg = data.get("arg") or {}
-        channel = arg.get("channel")
-        rows = data.get("data") or []
-        if not rows:
-            return
-
-        now = time.time()
-
-        if channel == "books":
-            book = rows[0]
-            if not isinstance(book, dict):
-                return
-            self.ws_orderbook_messages += 1
-            self.last_ws_orderbook_ts = now
-            self.last_seq_id = book.get("seqId")
-            self.last_prev_seq_id = book.get("prevSeqId")
-            self.last_checksum = book.get("checksum")
-            self.last_action = data.get("action")
-
-            if data.get("action") == "snapshot" or self.last_snapshot_ts is None:
-                self.analyzer.load_okj_book(book)
-                self.last_snapshot_ts = now
-            else:
-                self.analyzer.diff_okj_book(book)
-
-            self.analyzer.set_source("okj_ws_orderbook")
-            if self.ws_orderbook_messages <= 3:
-                LOG.info(
-                    "OKJ book #%d action=%s bids=%d asks=%d seq=%s prev=%s",
-                    self.ws_orderbook_messages,
-                    data.get("action"),
-                    len(book.get("bids") or []),
-                    len(book.get("asks") or []),
-                    book.get("seqId"),
-                    book.get("prevSeqId"),
-                )
-            await self.broadcast()
-            return
-
-        if channel == "trades":
-            changed = False
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                before = len(self.analyzer.trades)
-                self.analyzer.trade_okj(row)
-                changed = changed or len(self.analyzer.trades) > before
-            if changed:
-                self.ws_trade_messages += len(rows)
-                self.last_ws_trade_ts = now
-                await self.broadcast()
-            return
-
-        if channel == "tickers":
-            for row in rows:
-                if isinstance(row, dict):
-                    self.analyzer.ticker_okj(row)
-            self.ws_ticker_messages += len(rows)
-            self.last_ws_ticker_ts = now
-            await self.broadcast()
+        await self.bootstrap()
+        while not self._stop:
+            try: await self.once()
+            except asyncio.CancelledError: raise
+            except Exception as e:
+                self.last_error=str(e); self.connected=False; self.ws_transport_connected=False; self.a.set_ws(False,self.last_error)
+                self.ws_reconnects+=1; await asyncio.sleep(min(10,1+self.ws_reconnects))
+    def stop(self): self._stop=True
